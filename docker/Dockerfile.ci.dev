@@ -126,3 +126,35 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 ###
+
+FROM main as rl-gym
+ARG GYM_REPO=git@github.com:NVIDIA-NeMo/Gym.git
+ARG GYM_REF=main
+ARG APPTAINER_VERSION=1.4.1
+ENV NEMO_GYM_ROOT=/workspace/Gym
+
+RUN bash -ex <<"EOF"
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        wget \
+        build-essential \
+        nodejs \
+        npm
+    cd /tmp
+    wget https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb
+    apt-get install -y ./apptainer_${APPTAINER_VERSION}_amd64.deb
+    rm -f ./apptainer_${APPTAINER_VERSION}_amd64.deb
+    rm -rf /var/lib/apt/lists/*
+EOF
+
+RUN --mount=type=ssh \
+    --mount=type=cache,target=/root/.cache/uv \
+    bash -ex <<"EOF"
+    git clone ${GYM_REPO} ${NEMO_GYM_ROOT}
+    cd ${NEMO_GYM_ROOT}
+    git fetch origin ${GYM_REF}
+    git checkout FETCH_HEAD
+    uv pip install --editable .
+EOF

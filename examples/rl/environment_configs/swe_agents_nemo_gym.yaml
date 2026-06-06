@@ -1,0 +1,30 @@
+- agent_type: megatron.rl.agent.nemo_gym_agent.NemoGymAgent
+  agent_args:
+    env_id: nemo_gym/swe_agents
+    gym_root: /workspace/Gym
+
+    input_jsonl_fpath: responses_api_agents/swe_agents/data/example.jsonl
+    validation_input_jsonl_fpath: responses_api_agents/swe_agents/data/example.jsonl
+    train_agent_name: swe_agents_train
+    validation_agent_name: swe_agents_val
+
+    policy_model_name: megatron-policy
+    policy_api_key: NONE
+    policy_base_url:
+      - http://127.0.0.1:8294/v1
+
+    nemo_gym:
+      config_paths:
+        - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+        - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+
+      # Override these for the target cluster/dataset before running real SWE training.
+      swe_agents_train:
+        responses_api_agents:
+          swe_agents:
+            container_formatter: /path/to/swebench/containers/{instance_id}.sif
+      swe_agents_val:
+        responses_api_agents:
+          swe_agents:
+            container_formatter: /path/to/swebench/containers/{instance_id}.sif
+  weight: 1.0
