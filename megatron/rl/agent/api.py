@@ -7,17 +7,13 @@ from collections.abc import AsyncIterable
 from typing import Generic, TypeVar
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
-from ..inference import (
-    InferenceInterface,
-    LLMChatMessage,
-    ReturnsRaw,
-)
+from ..inference import InferenceInterface, LLMChatMessage, ReturnsRaw
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -52,6 +48,7 @@ class Rollout(AgentBaseModel):
     reward: float = None
     env_id: str = ''
     problem_id: str | None = None
+    metrics: dict[str, float | int | bool] = Field(default_factory=dict)
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
@@ -66,6 +63,7 @@ class TokenRollout(AgentBaseModel):
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
+    metrics: dict[str, float | int | bool] = Field(default_factory=dict)
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]

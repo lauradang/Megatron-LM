@@ -33,7 +33,7 @@ from megatron.core.transformer.cuda_graphs import (
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
-from megatron.rl.agent.api import TokenRollout
+from megatron.rl.agent.api import RolloutGroup, TokenRollout
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -195,6 +195,25 @@ class TestRLUtils:
             lang_module.config.cuda_graph_impl = set_to
 
         return MagicMock(side_effect=_toggle)
+
+    def _make_token_rollout(
+        self,
+        *,
+        reward=1.0,
+        env_id="env",
+        metrics=None,
+    ):
+        return TokenRollout(
+            trajectory=[[1, 2]],
+            reward=reward,
+            generation_mask=[[False, True]],
+            logprobs=[[-0.1]],
+            env_id=env_id,
+            policy_epoch=[[(0, 1)]],
+            kv_cache_epoch=[[(0, 1)]],
+            num_evictions=[0],
+            metrics=metrics or {},
+        )
 
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(self, monkeypatch):
         config = SimpleNamespace(
@@ -1047,3 +1066,135 @@ class TestRLUtils:
         assert metrics["max_num_evictions"] == 1
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
+
+    def test_compute_group_stats_aggregates_rollout_metrics_by_group(self):
+        rollouts = [
+            RolloutGroup(
+                rollouts=[
+                    self._make_token_rollout(
+                        reward=1.0,
+                        metrics={"custom/bool": True, "custom/value": 2.0},
+                    ),
+                    self._make_token_rollout(
+                        reward=0.0,
+                        metrics={"custom/bool": False, "custom/value": 4},
+                    ),
+                ],
+            ),
+            RolloutGroup(
+                rollouts=[
+                    self._make_token_rollout(
+                        reward=1.0,
+                        metrics={"custom/bool": True, "custom/value": 6.0},
+                    ),
+                    self._make_token_rollout(reward=0.0, metrics={"custom/late": 9.0}),
+                ],
+            ),
+        ]
+        rollouts[0][0].metrics["custom/string"] = "ignored"
+        rollouts[0][1].metrics["custom/nan"] = float("nan")
+        rollouts[1][0].metrics["custom/inf"] = float("inf")
+
+        stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), seq_len=2)
+
+        assert stats.rollout_metrics["custom/bool"] == [[1.0, 0.0], [1.0]]
+        assert stats.rollout_metrics["custom/value"] == [[2.0, 4.0], [6.0]]
+        assert stats.rollout_metrics["custom/late"] == [[], [9.0]]
+        assert "custom/string" not in stats.rollout_metrics
+        assert "custom/nan" not in stats.rollout_metrics
+        assert "custom/inf" not in stats.rollout_metrics
+
+    def test_prep_wandb_metrics_logs_custom_rollout_metric_summaries(self):
+        writer = MagicMock()
+
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[2, 2]],
+            turn_lens=[[2, 2]],
+            rewards=[[1.0, 0.0]],
+            num_turns=[[1, 1]],
+            advantages=[0.0, 1.0],
+            policy_epoch=[[[1], [2]]],
+            kv_cache_epoch=[[[1], [2]]],
+            completed_epochs=[[1, 2]],
+            num_evictions=[[0, 0]],
+            current_iteration=3,
+            rollout_metrics={"custom/score": [[1.0, 3.0], [5.0]]},
+        )
+
+        assert metrics["rollout_metrics/custom/score/mean"] == 3.0
+        assert metrics["rollout_metrics/custom/score/min"] == 1.0
+        assert metrics["rollout_metrics/custom/score/max"] == 5.0
+        assert "rollout_metrics/custom/score/hist" in metrics
+
+    def test_prep_wandb_metrics_converts_bool_metrics_to_rates(self):
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens=[[2, 2]],
+            turn_lens=[[2, 2]],
+            rewards=[[1.0, 0.0]],
+            num_turns=[[1, 1]],
+            advantages=[0.0, 1.0],
+            policy_epoch=[[[1], [2]]],
+            kv_cache_epoch=[[[1], [2]]],
+            completed_epochs=[[1, 2]],
+            num_evictions=[[0, 0]],
+            current_iteration=3,
+            rollout_metrics={"custom/bool": [[1.0, 0.0], [1.0]]},
+        )
+
+        assert metrics["rollout_metrics/custom/bool/mean"] == pytest.approx(2.0 / 3.0)
+
+    def test_maybe_log_training_metrics_preserves_env_specific_rollout_metrics(
+        self, monkeypatch
+    ):
+        writer = MagicMock()
+        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: writer)
+        monkeypatch.setattr(rl_utils, "get_tensorboard_writer", lambda: None)
+
+        rollouts = [
+            RolloutGroup(
+                rollouts=[
+                    self._make_token_rollout(
+                        reward=1.0,
+                        env_id="env_a",
+                        metrics={"custom/score": 1.0},
+                    ),
+                    self._make_token_rollout(
+                        reward=0.0,
+                        env_id="env_a",
+                        metrics={"custom/score": 3.0},
+                    ),
+                ],
+            ),
+            RolloutGroup(
+                rollouts=[
+                    self._make_token_rollout(
+                        reward=1.0,
+                        env_id="env_b",
+                        metrics={"custom/score": 5.0},
+                    ),
+                    self._make_token_rollout(
+                        reward=0.0,
+                        env_id="env_b",
+                        metrics={"custom/score": 7.0},
+                    ),
+                ],
+            ),
+        ]
+        tokenizer = MockTokenizer()
+        stats = rl_utils.compute_group_stats(rollouts, tokenizer, seq_len=2)
+
+        rl_utils.maybe_log_training_metrics(
+            group_stats=stats,
+            current_iteration=3,
+            tokenizer=tokenizer,
+            example_groups={"env_a": rollouts[0], "env_b": rollouts[1]},
+        )
+
+        logged_metrics = writer.log.call_args.args[0]
+        assert logged_metrics["rollout_metrics/custom/score/mean"] == 4.0
+        assert logged_metrics["env_a_rollout_metrics/custom/score/mean"] == 2.0
+        assert logged_metrics["env_b_rollout_metrics/custom/score/mean"] == 6.0
+        assert "env_a_mean_reward" in logged_metrics
+        assert "env_b_mean_reward" in logged_metrics

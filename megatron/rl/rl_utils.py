@@ -278,6 +278,7 @@ class RolloutStats:
     env_ids: list[str] # same length as len(rewards)
     turn_lens: list[list[int]] # token lengths of turns, grouped.
     traj_lens: list[list[int]] # all turns comprise one trajectory.
+    rollout_metrics: dict[str, list[list[float]]]
     num_turns: None | list[list[int]] # num_turns per traj
     advantages: None | list[list[float]]
     min_piold_to_inf_prob: None | float
@@ -293,6 +294,16 @@ class RolloutStats:
     kv_cache_epoch: list[list[int]]
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
+
+
+def _finite_rollout_metric_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, int | float):
+        float_value = float(value)
+        if math.isfinite(float_value):
+            return float_value
+    return None
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -874,6 +885,7 @@ def compute_group_stats(
     all_kv_cache_epoch = []
     all_completed_epochs = []
     all_num_evictions = []
+    rollout_metrics = {}
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
@@ -883,6 +895,7 @@ def compute_group_stats(
         group_kv_epoch = []
         group_completed_epochs = []
         group_num_evictions = []
+        group_rollout_metrics = defaultdict(list)
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -909,6 +922,15 @@ def compute_group_stats(
             group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
             group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
+            for metric_name, metric_value in rollout.metrics.items():
+                finite_value = _finite_rollout_metric_value(metric_value)
+                if finite_value is not None:
+                    group_rollout_metrics[metric_name].append(finite_value)
+        group_index = len(rewards)
+        for metric_name in list(rollout_metrics):
+            rollout_metrics[metric_name].append(group_rollout_metrics.pop(metric_name, []))
+        for metric_name, metric_values in group_rollout_metrics.items():
+            rollout_metrics[metric_name] = [[] for _ in range(group_index)] + [metric_values]
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
         all_completed_epochs.append(group_completed_epochs)
@@ -925,6 +947,7 @@ def compute_group_stats(
         traj_lens=traj_lens,
         turn_lens=turn_lens,
         rewards=rewards,
+        rollout_metrics=rollout_metrics,
         # --------
         # Everything above is per-group, i.e. it is a list of lists,
         # with the inner list being the group data.
@@ -963,6 +986,7 @@ def prep_wandb_metrics(
         current_iteration: int,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
+        rollout_metrics: dict[str, list[list[float]]] | None = None,
     ):
 
     """Make a wandb-parseable dictionary of metrics for logging.
@@ -981,6 +1005,7 @@ def prep_wandb_metrics(
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
+        rollout_metrics: Grouped scalar rollout metrics.
     """
 
     group_table = wandb_writer.Table(
@@ -1077,6 +1102,24 @@ def prep_wandb_metrics(
                 'staleness', 'Per-Token KV Cache Staleness'
             ),
     }
+    if rollout_metrics:
+        for metric_name, grouped_values in rollout_metrics.items():
+            values = []
+            for group in grouped_values:
+                for value in group:
+                    finite_value = _finite_rollout_metric_value(value)
+                    if finite_value is not None:
+                        values.append(finite_value)
+            if not values:
+                continue
+            metrics[f"rollout_metrics/{metric_name}/mean"] = np.mean(values)
+            metrics[f"rollout_metrics/{metric_name}/min"] = min(values)
+            metrics[f"rollout_metrics/{metric_name}/max"] = max(values)
+            metrics[f"rollout_metrics/{metric_name}/hist"] = wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['value'], data=[[value] for value in values]),
+                'value',
+                f"Rollout Metric {metric_name}",
+            )
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
@@ -1138,12 +1181,14 @@ def maybe_log_training_metrics(
     kv_cache_epoch = group_stats.kv_cache_epoch
     completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
+    rollout_metrics = group_stats.rollout_metrics
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
         policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
-        num_evictions=num_evictions, current_iteration=current_iteration)
+        num_evictions=num_evictions, current_iteration=current_iteration, rollout_metrics=rollout_metrics)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
+    env_rollout_metrics = lambda cont, idx: {metric: env_stats(groups, idx) for metric, groups in cont.items()}
     group_turn_counts = [sum(nt) for nt in num_turns]
 
     for env_id in set(group_stats.env_ids):
@@ -1168,6 +1213,7 @@ def maybe_log_training_metrics(
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
+            rollout_metrics=env_rollout_metrics(rollout_metrics, env_idx),
         )
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
