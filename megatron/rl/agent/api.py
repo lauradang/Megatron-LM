@@ -42,6 +42,7 @@ class GroupedRolloutRequest(Request):
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
     enforce_order: bool = False
+    submit_rollouts_individually: bool = False
 
 
 class Rollout(AgentBaseModel):
@@ -200,12 +201,22 @@ class GroupedRolloutGenerator(Agent, ABC):
             self.parallel_generation_tasks = parallel_generation_tasks
 
     @abstractmethod
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ) -> list[Rollout]:
+        ...
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
+        if request.submit_rollouts_individually:
+            assert request.streaming, "submit_rollouts_individually requires streaming grouped rollouts."
+            assert request.num_groups > 0, "num_groups must be positive."
+            assert request.rollouts_per_group > 0, "rollouts_per_group must be positive."
+            assert self.parallel_generation_tasks > 0, "parallel_generation_tasks must be positive."
 
         # When streaming, use buffer_size to create backpressure
         # for balanced generation in a multi-task setting.
@@ -222,20 +233,34 @@ class GroupedRolloutGenerator(Agent, ABC):
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
                 "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        assert self.parallel_generation_tasks >= groups_per_worker, \
-            f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
-        num_workers = self.parallel_generation_tasks // groups_per_worker
-        unused = self.parallel_generation_tasks % groups_per_worker
-        if unused:
-            logging.warning(
-                f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
-                f"divisible by num_groups ({groups_per_worker}); "
-                f"{unused} generation task(s) will be unused."
-            )
-        submission_gate = asyncio.Semaphore(num_workers)
+        if request.submit_rollouts_individually:
+            rollout_slots_per_worker = groups_per_worker * request.rollouts_per_group
+            num_workers = (
+                self.parallel_generation_tasks + rollout_slots_per_worker - 1
+            ) // rollout_slots_per_worker
+            if not request.filter_groups_with_same_reward:
+                num_workers += 1
+            submission_gate = asyncio.Semaphore(self.parallel_generation_tasks)
+        else:
+            assert self.parallel_generation_tasks >= groups_per_worker, \
+                f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
+            num_workers = self.parallel_generation_tasks // groups_per_worker
+            unused = self.parallel_generation_tasks % groups_per_worker
+            if unused:
+                logging.warning(
+                    f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
+                    f"divisible by num_groups ({groups_per_worker}); "
+                    f"{unused} generation task(s) will be unused."
+                )
+            submission_gate = asyncio.Semaphore(num_workers)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
-            group = await self.group_rollout(request=request)
+            group = await self.group_rollout(
+                request=request,
+                submission_gate=(
+                    submission_gate if request.submit_rollouts_individually else None
+                ),
+            )
             if (
                 not request.filter_groups_with_same_reward
                 or np.std([r.reward for r in group]) > 1e-6
@@ -250,7 +275,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         async def generate_task():
             nonlocal submitted_groups
             while request.streaming or submitted_groups < request.num_groups:
-                await submission_gate.acquire()
+                if not request.submit_rollouts_individually:
+                    await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
                 if groups_per_worker > 1:
@@ -264,7 +290,8 @@ class GroupedRolloutGenerator(Agent, ABC):
                             pass
                     elif not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker
-                        submission_gate.release()
+                        if not request.submit_rollouts_individually:
+                            submission_gate.release()
 
         tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
 
@@ -293,11 +320,13 @@ class GroupedRolloutGenerator(Agent, ABC):
                         next_batch_id += 1
                         for g in batch:
                             yield g
-                        submission_gate.release()
+                        if not request.submit_rollouts_individually:
+                            submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
                     yield group
-                    submission_gate.release()
+                    if not request.submit_rollouts_individually:
+                        submission_gate.release()
         finally:
             shutdown_task.cancel()
             for task in tasks:

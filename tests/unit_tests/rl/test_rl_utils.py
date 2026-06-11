@@ -271,6 +271,48 @@ class TestRLUtils:
         assert args.rl_generation_batch_size == expected_generation_batch_size
         assert args.rl_enforce_generation_order is expected_enforce_order
 
+    def test_rl_submit_rollouts_individually_requires_partial_rollouts(self):
+        with pytest.raises(AssertionError, match="requires --rl-partial-rollouts"):
+            self.create_test_args(
+                perform_rl_step=True,
+                rl_partial_rollouts=False,
+                rl_submit_rollouts_individually=True,
+            )
+
+    def test_rl_num_parallel_generations_keeps_existing_group_slot_behavior(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            grpo_group_size=4,
+            rl_num_parallel_generations=12,
+        )
+
+        assert args.rl_parallel_generation_tasks == 3
+
+    def test_rl_submit_rollouts_individually_uses_rollout_slots(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_submit_rollouts_individually=True,
+            grpo_group_size=4,
+            rl_num_parallel_generations=10,
+        )
+
+        assert args.rl_parallel_generation_tasks == 10
+
+    def test_rl_submit_rollouts_individually_expands_generation_batches_by_group_size(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_submit_rollouts_individually=True,
+            grpo_group_size=4,
+            grpo_prompts_per_step=8,
+            rl_generation_batch_size=2,
+            rl_num_parallel_generation_batches=3,
+        )
+
+        assert args.rl_parallel_generation_tasks == 24
+
     @pytest.mark.parametrize(
         "rl_generation_batch_size, grpo_prompts_per_step, error",
         [
