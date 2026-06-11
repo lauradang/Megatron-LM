@@ -553,8 +553,16 @@ def validate_args(args, defaults={}):
                 args.rl_generation_batch_size = 1
             args.rl_parallel_generation_tasks = 512
 
+        if args.rl_partial_rollouts:
+            assert args.grpo_prompts_per_step % args.rl_generation_batch_size == 0, \
+                f"--grpo-prompts-per-step ({args.grpo_prompts_per_step}) must be divisible by " \
+                f"--rl-generation-batch-size ({args.rl_generation_batch_size})."
+
         # Derive enforce_order after all resolution is complete.
-        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+        args.rl_enforce_generation_order = (
+            args.rl_generation_batch_size > 1
+            or (args.rl_partial_rollouts and args.grpo_prompts_per_step > 1)
+        )
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
@@ -1141,7 +1149,7 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-    
+
         if args.nccl_ub:
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -1156,7 +1164,7 @@ def validate_args(args, defaults={}):
 
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
-        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
+        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1756,10 +1764,10 @@ def validate_args(args, defaults={}):
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
-    
+
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
-        
+
     if args.mla_down_proj_fusion:
         assert args.multi_latent_attention, "--mla-down-proj-fusion requires --multi-latent-attention"
 
@@ -2393,7 +2401,10 @@ def _add_rl_args(parser):
                             'Requires --rl-partial-rollouts. '
                             'Mutually exclusive with --rl-num-parallel-generations.')
     group.add_argument('--rl-generation-batch-size', type=int, default=None,
-                       help='Override the number of groups per generation batch. '
+                       help='Number of rollout groups submitted together for generation. '
+                            'Set to 1 to submit rollout groups independently. '
+                            'The trainer still collects grpo_prompts_per_step groups '
+                            'before preparing data. '
                             'Defaults to grpo_prompts_per_step when '
                             '--rl-num-parallel-generation-batches is set.')
     group.add_argument('--grpo-iterations', type=int, default=2,
@@ -2452,7 +2463,7 @@ def _add_rl_args(parser):
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
-                       help='Degree of tensor model parallelism for inference for RL.')     
+                       help='Degree of tensor model parallelism for inference for RL.')
     group.add_argument(
         '--rl-inference-pipeline-model-parallel-size',
         type=int,

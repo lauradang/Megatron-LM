@@ -165,6 +165,54 @@ class TestRLUtils:
         set_global_variables(args, False)
         return args
 
+    @pytest.mark.parametrize(
+        "rl_generation_batch_size, grpo_prompts_per_step, expected_enforce_order",
+        [
+            pytest.param(1, 1, False, id="group-submit-group-consume"),
+            pytest.param(1, 8, True, id="group-submit-batch-consume"),
+            pytest.param(4, 8, True, id="batch-submit-batch-consume"),
+        ],
+    )
+    def test_rl_generation_batch_size_validation(
+        self, rl_generation_batch_size, grpo_prompts_per_step, expected_enforce_order
+    ):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_generation_batch_size=rl_generation_batch_size,
+            grpo_prompts_per_step=grpo_prompts_per_step,
+        )
+
+        assert args.rl_enforce_generation_order is expected_enforce_order
+
+    @pytest.mark.parametrize(
+        "rl_generation_batch_size, grpo_prompts_per_step, error",
+        [
+            pytest.param(
+                4,
+                10,
+                "must be divisible by --rl-generation-batch-size",
+                id="partial-generation-batch",
+            ),
+            pytest.param(
+                0,
+                8,
+                "--rl-generation-batch-size must be positive",
+                id="nonpositive-generation-batch",
+            ),
+        ],
+    )
+    def test_rl_generation_batch_size_validation_errors(
+        self, rl_generation_batch_size, grpo_prompts_per_step, error
+    ):
+        with pytest.raises(AssertionError, match=error):
+            self.create_test_args(
+                perform_rl_step=True,
+                rl_partial_rollouts=True,
+                rl_generation_batch_size=rl_generation_batch_size,
+                grpo_prompts_per_step=grpo_prompts_per_step,
+            )
+
     def _patch_rl_inference_mode_deps(self, monkeypatch, args):
         interface = MagicMock()
         interface.resume.return_value = object()
