@@ -212,7 +212,7 @@ class WeightedMultiTask(
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
-                    submit_rollouts_individually=request.submit_rollouts_individually,
+                    submission_granularity=request.submission_granularity,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
             else:

@@ -16,6 +16,7 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
+from megatron.rl.rollout_granularity import RLRolloutGranularity
 
 
 class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
@@ -289,7 +290,7 @@ class TestGroupedRollouts:
             inference_interface=RecordingInference(),
             streaming=True,
             enforce_order=True,
-            submit_rollouts_individually=True,
+            submission_granularity=RLRolloutGranularity.ROLLOUT,
         )
 
         groups = await collect_groups(gen, request, 1)
@@ -310,7 +311,7 @@ class TestGroupedRollouts:
             inference_interface=inference,
             streaming=True,
             enforce_order=True,
-            submit_rollouts_individually=True,
+            submission_granularity=RLRolloutGranularity.ROLLOUT,
         )
 
         await collect_groups(gen, request, 1)
@@ -329,7 +330,7 @@ class TestGroupedRollouts:
             inference_interface=inference,
             streaming=True,
             enforce_order=True,
-            submit_rollouts_individually=True,
+            submission_granularity=RLRolloutGranularity.ROLLOUT,
         )
 
         groups = await collect_groups(gen, request, 2)
@@ -348,7 +349,7 @@ class TestGroupedRollouts:
             inference_interface=RecordingInference(slow_calls={0}),
             streaming=True,
             enforce_order=False,
-            submit_rollouts_individually=True,
+            submission_granularity=RLRolloutGranularity.ROLLOUT,
         )
 
         groups = await collect_groups(gen, request, 2)
@@ -364,7 +365,7 @@ class TestGroupedRollouts:
             inference_interface=RecordingInference(slow_calls={0}),
             streaming=True,
             enforce_order=True,
-            submit_rollouts_individually=True,
+            submission_granularity=RLRolloutGranularity.ROLLOUT,
         )
 
         groups = await collect_groups(gen, request, 1)
@@ -384,7 +385,7 @@ class TestGroupedRollouts:
             streaming=True,
             enforce_order=True,
             filter_groups_with_same_reward=True,
-            submit_rollouts_individually=True,
+            submission_granularity=RLRolloutGranularity.ROLLOUT,
         )
 
         groups = await collect_groups(gen, request, 1)

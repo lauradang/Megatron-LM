@@ -18,6 +18,7 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+from ..rollout_granularity import RLRolloutGranularity
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -42,7 +43,7 @@ class GroupedRolloutRequest(Request):
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
     enforce_order: bool = False
-    submit_rollouts_individually: bool = False
+    submission_granularity: RLRolloutGranularity | None = None
 
 
 class Rollout(AgentBaseModel):
@@ -212,8 +213,13 @@ class GroupedRolloutGenerator(Agent, ABC):
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
-        if request.submit_rollouts_individually:
-            assert request.streaming, "submit_rollouts_individually requires streaming grouped rollouts."
+        submit_at_rollout_granularity = (
+            request.submission_granularity == RLRolloutGranularity.ROLLOUT
+        )
+        if submit_at_rollout_granularity:
+            assert (
+                request.streaming
+            ), "Rollout submission granularity requires streaming grouped rollouts."
             assert request.num_groups > 0, "num_groups must be positive."
             assert request.rollouts_per_group > 0, "rollouts_per_group must be positive."
             assert self.parallel_generation_tasks > 0, "parallel_generation_tasks must be positive."
@@ -233,7 +239,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
                 "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        if request.submit_rollouts_individually:
+        if submit_at_rollout_granularity:
             rollout_slots_per_worker = groups_per_worker * request.rollouts_per_group
             num_workers = (
                 self.parallel_generation_tasks + rollout_slots_per_worker - 1
@@ -257,9 +263,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         async def generate_and_enqueue(batch_id, index_in_batch):
             group = await self.group_rollout(
                 request=request,
-                submission_gate=(
-                    submission_gate if request.submit_rollouts_individually else None
-                ),
+                submission_gate=(submission_gate if submit_at_rollout_granularity else None),
             )
             if (
                 not request.filter_groups_with_same_reward
@@ -275,7 +279,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         async def generate_task():
             nonlocal submitted_groups
             while request.streaming or submitted_groups < request.num_groups:
-                if not request.submit_rollouts_individually:
+                if not submit_at_rollout_granularity:
                     await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
@@ -290,7 +294,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                             pass
                     elif not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker
-                        if not request.submit_rollouts_individually:
+                        if not submit_at_rollout_granularity:
                             submission_gate.release()
 
         tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
@@ -320,12 +324,12 @@ class GroupedRolloutGenerator(Agent, ABC):
                         next_batch_id += 1
                         for g in batch:
                             yield g
-                        if not request.submit_rollouts_individually:
+                        if not submit_at_rollout_granularity:
                             submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
                     yield group
-                    if not request.submit_rollouts_individually:
+                    if not submit_at_rollout_granularity:
                         submission_gate.release()
         finally:
             shutdown_task.cancel()
