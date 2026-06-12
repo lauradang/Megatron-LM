@@ -216,13 +216,6 @@ class GroupedRolloutGenerator(Agent, ABC):
         submit_at_rollout_granularity = (
             request.submission_granularity == RLRolloutGranularity.ROLLOUT
         )
-        if submit_at_rollout_granularity:
-            assert (
-                request.streaming
-            ), "Rollout submission granularity requires streaming grouped rollouts."
-            assert request.num_groups > 0, "num_groups must be positive."
-            assert request.rollouts_per_group > 0, "rollouts_per_group must be positive."
-            assert self.parallel_generation_tasks > 0, "parallel_generation_tasks must be positive."
 
         # When streaming, use buffer_size to create backpressure
         # for balanced generation in a multi-task setting.

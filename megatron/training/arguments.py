@@ -543,6 +543,10 @@ def validate_args(args, defaults={}):
         submit_rollouts_at_rollout_granularity = (
             args.rl_submission_granularity == RLRolloutGranularity.ROLLOUT
         )
+        if submit_rollouts_at_rollout_granularity:
+            assert (
+                args.rl_partial_rollouts
+            ), "Rollout submission granularity requires streaming grouped rollouts."
 
         explicit_granularity = (
             args.rl_submission_granularity is not None

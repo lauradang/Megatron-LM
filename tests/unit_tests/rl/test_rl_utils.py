@@ -303,7 +303,9 @@ class TestRLUtils:
         assert args.rl_enforce_generation_order is expected_enforce_order
 
     def test_rl_rollout_submission_granularity_requires_partial_rollouts(self):
-        with pytest.raises(AssertionError, match="requires --rl-partial-rollouts"):
+        with pytest.raises(
+            AssertionError, match="requires streaming grouped rollouts"
+        ):
             self.create_test_args(
                 perform_rl_step=True,
                 rl_partial_rollouts=False,
