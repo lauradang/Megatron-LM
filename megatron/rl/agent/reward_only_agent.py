@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
+import functools
 from typing import Any
 
 import numpy as np
@@ -247,16 +249,27 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         return rollout
 
-    async def _agenerate(
+    async def get_rollout_response(
         self,
         request: RolloutRequest | GroupedRolloutRequest | EvaluationRequest,
         inference_request: InferenceRequest,
     ) -> InferenceResponse:
         return await request.inference_interface.agenerate(inference_request)
 
-    async def rollout(self, request: RolloutRequest) -> Rollout:
-        prompt, golden = await self.get_prompt(validation=request.validation)
-        return await self._run_episode(prompt, golden, request)
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
+        assert isinstance(
+            request.inference_interface, ReturnsRaw
+        ), "InferenceInterface must support raw_text return to provide rollouts."
+
+        async def _single_rollout() -> Rollout:
+            # Route through _run_episode (not prepare_group_rollout +
+            # get_rollout_response) so max_turns > 1 multi-turn episodes work.
+            prompt, golden = await self.get_prompt(validation=request.validation)
+            return await self._run_episode(prompt, golden, request)
+
+        return list(
+            await asyncio.gather(*[_single_rollout() for _ in range(request.num_rollouts)])
+        )
 
     async def prepare_group_rollout(
         self,
@@ -269,10 +282,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        async def build_rollout(response: InferenceResponse) -> Rollout:
-            return await self._rollout_from_response(request, response, golden)
-
-        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+        return GroupRolloutParams(
+            inference_request=inference_request,
+            build_rollout=functools.partial(self._rollout_from_response, request, golden=golden),
+        )
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
@@ -282,7 +295,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        response = await self._agenerate(request, inference_request)
+        response = await self.get_rollout_response(request, inference_request)
         response_text = response.response.content
 
         result = RewardEvaluationResult(

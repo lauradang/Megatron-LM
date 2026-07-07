@@ -11,12 +11,9 @@ import re
 import types
 
 import torch
-import torch.nn.functional as F
-from packaging.version import Version as PkgVersion
 
-from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.rerun_state_machine import RerunStateMachine
-from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -26,18 +23,12 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
-from megatron.core.transformer.heterogeneous.heterogeneous_config import (
-    HeterogeneousTransformerConfig,
-    MLPConfig,
-)
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -47,12 +38,9 @@ from megatron.training.utils import (
 )
 from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
 
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
+
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -79,6 +67,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_logits_distillation_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -1501,6 +1490,13 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
+    assert not (
+        args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'
+    ), (
+        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    )
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -1605,6 +1601,28 @@ def validate_args(args, defaults={}):
     if not args.async_save:
         args.async_strategy = "mcore"
 
+    if args.logits_save_dir is not None:
+        assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
+        assert args.async_save, (
+            '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
+            'Logits are flushed as an async request in the checkpoint queue.'
+        )
+
+    if args.freeze_all_layers:
+        if args.use_distributed_optimizer:
+            warn_rank_0(
+                '--freeze-all-layers incompatible with use_distributed_optimizer. Disabling use_distributed_optimizer.'
+            )
+            args.use_distributed_optimizer = False
+        if args.overlap_param_gather:
+            warn_rank_0(
+                '--freeze-all-layers incompatible with overlap_param_gather. Disabling overlap_param_gather.'
+            )
+            args.overlap_param_gather = False
+
+    if args.override_ckpt_iteration is not None:
+        assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -1612,8 +1630,6 @@ def validate_args(args, defaults={}):
         assert (
             args.cuda_graph_impl == "none"
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
-
-
 
     # MoE upcycling check
     if args.moe_use_upcycling:
@@ -1941,16 +1957,36 @@ def _add_inference_args(parser):
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
                        help='GPU memory budget (in GB) for the Mamba state cache '
                        'used by prefix caching on hybrid models. When set, Mamba '
-                       'states at block boundaries are cached for reuse.')
+                       'states at block boundaries are cached for reuse. This budget '
+                       'covers both the durable cache (the ssm_states/conv_states '
+                       'slots reused across requests) and the per-step extraction '
+                       'scratch (the intermediate_ssm_out/intermediate_conv_out '
+                       'buffers, sized to 3 * max_requests slots); the scratch is '
+                       'reserved first, so a larger max_requests leaves fewer durable '
+                       'slots.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
+                       type=str, default='exponential',
+                       choices=['exponential', 'linear'],
+                       dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
+                       help='Spacing of CUDA graph token counts. "exponential" (default) '
+                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
+                            'log-spaced distribution with bounded relative padding. '
+                            '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
                        choices=['torch', 'flashinfer'],
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-logprobs-mode',
+                       type=str, default='raw_logprobs',
+                       choices=['raw_logprobs', 'processed_logprobs'],
+                       help='How returned inference log-probs are computed engine-wide. '
+                            '"raw_logprobs" (default) uses the unmodified model logits; '
+                            '"processed_logprobs" uses temperature and filters by top-k/top-p.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
@@ -1978,6 +2014,14 @@ def _add_inference_args(parser):
                        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
                             'Pause/unpause take effect as soon as the signal is delivered to a rank. '
                             'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
+    group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
+                       help='Partition the world into independent inference models, each with '
+                            'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
+                            'Shards are separated by "+" or ";"; per-shard keys are '
+                            'tp,pp,ep,expt_tp,dp (each defaults to 1) and must partition the full '
+                            'world. Tagging shards role=prefill|decode enables disaggregated '
+                            'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
+                            'is several independent decode instances.')
     return parser
 
 
@@ -1987,6 +2031,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "moe_grad_scale_func",
         "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
@@ -1996,6 +2041,7 @@ def _add_network_size_args(parser):
         "output_layer_init_method",
         "embedding_init_method",
         "activation_func",
+        "experimental_attention_variant_loss_scale_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
@@ -2070,6 +2116,7 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        "mamba_training_ssm_states_dtype",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2098,6 +2145,17 @@ def _add_network_size_args(parser):
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
                         choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
+    group.add_argument('--yarn-original-max-position-embeddings', type=int, default=None,
+                       help='Original maximum position embeddings for YaRN RoPE frequency correction.')
+    group.add_argument('--yarn-beta-fast', type=float, default=None,
+                       help='Beta fast for YaRN RoPE frequency correction.')
+    group.add_argument('--yarn-beta-slow', type=float, default=None,
+                       help='Beta slow for YaRN RoPE frequency correction.')
+    group.add_argument('--yarn-correction-range-round-to-int', action='store_true', default=None,
+                       help='Round YaRN correction range endpoints to integers.')
+    group.add_argument('--no-yarn-correction-range-round-to-int', action='store_false',
+                       dest='yarn_correction_range_round_to_int',
+                       help='Do not round YaRN correction range endpoints to integers.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
     group.add_argument('--relative-attention-max-distance', type=int, default=128,
@@ -2517,6 +2575,10 @@ def _add_rl_args(parser):
                              'boundary), so the policy is not penalised for a possibly-good generation that simply '
                              'ran out of room. Implemented by zeroing those turns generation mask (zero loss/grad); '
                              'advantages are computed earlier and are unaffected. Default is False.')
+    group.add_argument('--rl-profile', action='store_true', default=False,
+                        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).')
+    group.add_argument('--rl-profile-dir', type=str, default=None,
+                        help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
@@ -2665,6 +2727,8 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
+    group.add_argument('--freeze-all-layers', action='store_true',
+                       help='Freeze all layers of the model.')
 
     return parser
 
@@ -2683,6 +2747,10 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--override-ckpt-iteration', type=int, default=None,
+                       help='Override the iteration stored in the loaded checkpoint. '
+                            'Also resets consumed_train_samples accordingly so the '
+                            'data loader replays samples from that iteration onward.')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
@@ -2726,6 +2794,9 @@ def _add_mixed_precision_args(parser):
                        'for lm head to fp16.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
+    group.add_argument('--mamba-training-ssm-states-dtype', type=str,
+                       choices=['fp32', 'bf16'], default=None,
+                       help='Dtype of the materialized inter-chunk SSM states in Mamba training')
 
     return parser
 
@@ -3389,6 +3460,46 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    return parser
+
+def _add_logits_distillation_args(parser):
+    group = parser.add_argument_group(title='Logits Distillation')
+
+    group.add_argument('--logits-save-top-k', type=int, default=None,
+                       help='Number of top logits to save.')
+    group.add_argument('--logits-save-top-p', type=float, default=None,
+                       help='Top-P (nucleus) threshold applied after top-K '
+                            'selection when saving logits. Only the smallest '
+                            'set of entries whose cumulative probability mass '
+                            'reaches this threshold is kept. Must be in (0, 1].')
+    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
+                       help='Minimum number of entries kept per token when '
+                            'top-P masking is active, regardless of '
+                            'cumulative mass. Default: 1.')
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-dtype', type=str, default='fp16',
+                       choices=['fp16', 'bf16', 'fp32'],
+                       help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-load-dir', type=str, default=None,
+                       help='Directory to load logits.')
+    group.add_argument('--logits-load-decode-threads', type=int, default=4,
+                       help='Number of decode threads for cached-logits zstd '
+                            'decompression and torch.load processing.')
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
+                       help='PyTorch DataLoader prefetch factor for decoded '
+                            'cached-logits iterations. (Non-MSC only)')
+    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
+                       help='For MSC/object-storage logits tar shards, number '
+                            'of whole tar shards to prefetch into the MSC '
+                            'cache ahead of sequential tar consumption.')
+    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
+                       help='KD loss alpha for loading logits. Total loss is calculated as '
+                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
+    group.add_argument('--logits-load-ignore-errors', action='store_true',
+                       default=False,
+                       help='When set, KD loss errors are logged as warnings and '
+                            'training falls back to LM-only loss instead of crashing.')
     return parser
 
 

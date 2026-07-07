@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
@@ -12,7 +13,9 @@ from megatron.rl.agent.api import (
     GroupRolloutParams,
     Rollout,
     RolloutGenerator,
+    RolloutRequest,
 )
+from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
 
@@ -55,10 +58,10 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         self._call_count = 0
         self.prepare_group_rollout_calls = 0
 
-    async def rollout(self, request):
+    async def get_reward_rollouts(self, request):
         raise NotImplementedError
 
-    async def _agenerate(self, request, inference_request):
+    async def get_rollout_response(self, request, inference_request):
         return await request.inference_interface.agenerate(inference_request)
 
     async def prepare_group_rollout(self, request):
@@ -81,6 +84,35 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
             )
 
         return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+
+
+class CountingRewardAgent(RewardOnlyAgent):
+    """Minimal RewardOnlyAgent: prompts t0, t1, ... and reward = echoed index."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.env_id = "reward-test"
+        self._prompt_count = 0
+
+    async def get_prompt(self, validation):
+        idx = self._prompt_count
+        self._prompt_count += 1
+        return f"t{idx}", {"idx": idx}
+
+    async def get_reward(self, response, golden, finish_reason):
+        return float(int(response.removeprefix("t")) == golden["idx"])
+
+
+class TestRewardRollouts:
+    @pytest.mark.asyncio
+    async def test_get_reward_rollouts_matches_per_rollout_composition(self):
+        agent = CountingRewardAgent()
+        request = RolloutRequest(num_rollouts=4, inference_interface=MockInferenceInterface())
+        rollouts = await agent.get_reward_rollouts(request)
+        assert len(rollouts) == 4
+        assert sorted(r.trajectory[0] for r in rollouts) == ["t0", "t1", "t2", "t3"]
+        assert all(r.reward == 1.0 for r in rollouts)
+        assert all(r.env_id == "reward-test" for r in rollouts)
 
 
 class TestGroupedRollouts:
@@ -278,3 +310,41 @@ class TestGroupedRollouts:
         assert [agent.parallel_generation_tasks for agent in mt.agents] == (
             expected_parallel_generation_tasks
         )
+
+    @pytest.mark.parametrize(
+        "num_groups, all_envs_active",
+        [
+            pytest.param(1, False, id="num_groups_1_starves_an_env"),
+            pytest.param(8, True, id="trainer_batch_size_keeps_all_envs_active"),
+        ],
+    )
+    def test_multi_env_distribution_requires_num_groups_above_one(
+        self, num_groups, all_envs_active
+    ):
+        """Regression for the removed ``num_groups=1`` streaming override.
+
+        With multiple weighted environments, ``num_groups=1`` hands the single
+        group to one environment and leaves the other with zero groups. It also
+        collapses ``agent_slots`` (computed without remainder distribution) to all
+        zeros, so ``np.gcd.reduce`` is 0 and the per-agent slot counts become
+        ``nan`` -- which stalls ``get_grouped_rollouts``. Keeping ``num_groups`` at
+        the trainer batch size (> 1) keeps every environment active with a valid,
+        non-zero slot count.
+        """
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+
+        agent_groups = mt._distribute_counts(num_groups)
+        agent_slots = mt._distribute_counts(num_groups, distribute_remainder=False)
+
+        assert all(groups > 0 for groups in agent_groups) is all_envs_active
+        if all_envs_active:
+            assert min(agent_slots) > 0
+            assert np.gcd.reduce(agent_slots) > 0
+        else:
+            assert min(agent_groups) == 0
+            assert all(slots == 0 for slots in agent_slots)
+            assert np.gcd.reduce(agent_slots) == 0
