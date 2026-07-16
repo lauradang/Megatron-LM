@@ -1431,6 +1431,11 @@ def _turn_prompt_length(rollout, turn_idx: int) -> Optional[int]:
 # Lazily-opened JSONL file handle for the per-run staleness dump (rank 0 only).
 _STALENESS_DUMP_FILE = None
 
+# All-equal rewards => ~zero advantage => no gradient (the GRPO group-filter target).
+# Shared by the staleness JSONL dump and the wandb group metrics so the two
+# definitions of "degenerate group" cannot drift.
+_DEGENERATE_GROUP_STD_EPS = 1e-6
+
 
 def dump_staleness_data(
     rollouts: GroupedRollouts, group_stats: RolloutStats, current_iteration: int
@@ -1473,8 +1478,7 @@ def dump_staleness_data(
         group_rewards = group_stats.rewards[group_idx]
         group_reward_mean = float(np.mean(group_rewards))
         group_reward_std = float(np.std(group_rewards))
-        # All-equal rewards => ~zero advantage => no gradient (the GRPO group-filter target).
-        group_degenerate = group_reward_std < 1e-6
+        group_degenerate = group_reward_std < _DEGENERATE_GROUP_STD_EPS
         for rollout_idx, rollout in enumerate(group):
             turns = []
             for turn_idx, (pe, kve) in enumerate(
@@ -1737,10 +1741,10 @@ def prep_wandb_metrics(
     def _lag(grouped_epochs):
         return [current_iteration - e for g in grouped_epochs for e in g]
 
-    def _dist(prefix, values, title, native_hist=True):
+    def _dist(prefix, values, title, native_hist=True, table_hist=True):
         """Scalars + a Table-backed histogram chart for a 1-D list of values; also a
         native wandb.Histogram (stacks into an over-time heatmap) when native_hist.
-        The Table is always kept, so the raw values stay queryable."""
+        The Table is kept (unless table_hist=False), so the raw values stay queryable."""
         if not values:
             return {}
         arr = np.asarray(values, dtype=float)
@@ -1751,11 +1755,12 @@ def prep_wandb_metrics(
             f'{prefix}/p50': float(np.percentile(arr, 50)),
             f'{prefix}/p90': float(np.percentile(arr, 90)),
             f'{prefix}/p99': float(np.percentile(arr, 99)),
-            f'{prefix}_hist': wandb_writer.plot.histogram(
+        }
+        if table_hist:
+            out[f'{prefix}_hist'] = wandb_writer.plot.histogram(
                 wandb_writer.Table(columns=['value'], data=[[v] for v in values]),
                 'value', title,
-            ),
-        }
+            )
         if native_hist:
             out[f'{prefix}/histogram'] = wandb_writer.Histogram(values)
         return out
@@ -1775,9 +1780,11 @@ def prep_wandb_metrics(
     kv_avg = _lag(kv_avg_epoch)
     kv_last = _lag(kv_last_epoch)
 
+    group_means = [float(np.mean(g)) for g in rewards]
+    group_stds = [float(np.std(g)) for g in rewards]
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
+        data=list(zip(group_means, group_stds)),
     )
 
     metrics = {
@@ -1828,6 +1835,21 @@ def prep_wandb_metrics(
         ),
     }
 
+    # Advantage distribution (per-turn flat list; turns repeat their rollout's
+    # advantage, consistent with advantages_hist above). mean_advantage is kept
+    # for existing dashboards.
+    metrics.update(_dist('advantage', list(advantages), 'GRPO advantages'))
+
+    # Group reward quality: within-group advantage normalization hides group
+    # quality, so track reward mean/std per group plus the degenerate-group
+    # (std ~ 0 => no gradient signal) count. Scalars/native hists only; the
+    # table-backed charts already exist as group_means_hist/group_stds_hist.
+    degenerate = [s < _DEGENERATE_GROUP_STD_EPS for s in group_stds]
+    metrics['groups/degenerate_count'] = int(sum(degenerate))
+    metrics['groups/degenerate_fraction'] = float(np.mean(degenerate))
+    metrics.update(_dist('groups/reward_mean', group_means, 'Group reward means', table_hist=False))
+    metrics.update(_dist('groups/reward_std', group_stds, 'Group reward stds', table_hist=False))
+
     # Staleness distributions: staleness/{policy|kv_cache}/{first|avg|last}/...
     metrics.update(_dist('staleness/policy/first', policy_first, 'Policy lag (first token)'))
     metrics.update(_dist('staleness/policy/avg', policy_avg, 'Policy lag (avg token)'))
@@ -1835,6 +1857,21 @@ def prep_wandb_metrics(
     metrics.update(_dist('staleness/kv_cache/first', kv_first, 'KV-cache lag (first token)'))
     metrics.update(_dist('staleness/kv_cache/avg', kv_avg, 'KV-cache lag (avg token)'))
     metrics.update(_dist('staleness/kv_cache/last', kv_last, 'KV-cache lag (last token)'))
+
+    # Group-scope distributions (histograms only; per-group scalar series would
+    # explode metric cardinality): per-group mean lag and mean rollout length.
+    def _group_mean_hist(key, grouped, to_value):
+        vals = [to_value(float(np.mean(g))) for g in grouped if len(g)]
+        if vals:
+            metrics[key] = wandb_writer.Histogram(vals)
+
+    _group_mean_hist(
+        'staleness/policy/avg/group_hist', policy_avg_epoch, lambda e: current_iteration - e
+    )
+    _group_mean_hist(
+        'staleness/kv_cache/avg/group_hist', kv_avg_epoch, lambda e: current_iteration - e
+    )
+    _group_mean_hist('length/traj/group_hist', traj_lens, lambda v: v)
 
     # Rollout-length and eviction distributions.
     metrics.update(_dist('length/traj', traj_lens_flat, 'Trajectory lengths'))
@@ -1974,6 +2011,15 @@ def maybe_log_training_metrics(
     # Collect on rank 0 and broadcast so the writer rank can log it. This is
     # a collective, so it must run on every rank before the early return.
     pipeline_metrics = _collect_rollout_pipeline_metrics()
+    # In-flight rollout counters live on rank 0 (inflight_tracker); piggyback on
+    # the same rank-0 -> all broadcast below so the last-rank writer can log
+    # them. Sampled once per iteration, right after the wave is consumed; the
+    # per-engine-step curve stays in the --rl-log-inference-batch-trace JSONL.
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+        snap = inflight_snapshot()
+        pipeline_metrics['inflight_rollouts'] = snap['inflight_rollouts']
+        pipeline_metrics['rollouts_submitted_total'] = snap['submitted_total']
+        pipeline_metrics['rollouts_consumed_total'] = snap['consumed_total']
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         payload = [pipeline_metrics]
         dist.broadcast_object_list(payload, src=0)

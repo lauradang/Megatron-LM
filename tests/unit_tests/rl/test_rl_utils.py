@@ -1224,6 +1224,27 @@ class TestRLUtils:
             "evictions/per_rollout_hist",
         ]:
             assert key in metrics, f"missing table-backed histogram {key}"
+        # Advantage distribution (advantages=[0, 1]).
+        assert metrics["advantage/mean"] == 0.5
+        assert metrics["advantage/max"] == 1
+        assert "advantage/histogram" in metrics
+        # Group reward quality: means=[1.0, 0.5], stds=[0.0, 1.5] -> group 0 degenerate.
+        assert metrics["groups/degenerate_count"] == 1
+        assert metrics["groups/degenerate_fraction"] == 0.5
+        assert metrics["groups/reward_mean/mean"] == 0.75
+        assert metrics["groups/reward_std/max"] == 1.5
+        # Scalars/native hists only for group reward stats; the table-backed charts
+        # already exist as group_means_hist/group_stds_hist.
+        assert "groups/reward_mean_hist" not in metrics
+        assert "groups/reward_std_hist" not in metrics
+        assert "group_means_hist" in metrics
+        # Group-scope native histograms (per-group mean lag / mean traj length).
+        for key in [
+            "staleness/policy/avg/group_hist",
+            "staleness/kv_cache/avg/group_hist",
+            "length/traj/group_hist",
+        ]:
+            assert key in metrics, f"missing group-scope histogram {key}"
 
     def test_rollout_epoch_summary(self):
         # On-policy single turn/epoch: first == avg == last.

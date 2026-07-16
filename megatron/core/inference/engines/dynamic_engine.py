@@ -1950,6 +1950,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 "paused_request_count": self.context.paused_request_count,
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
+                # Post-schedule prefill/decode split of the batch about to run
+                # (same semantics as the inference step tracer above).
+                "prefill_request_count": self.context.num_prefill_requests,
+                "decode_request_count": self.context.num_decode_requests,
             }
         else:
             # active_token_count and step_count are still consumed by
@@ -2396,6 +2400,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
+                'inference/prefill_request_count': int(context_state['prefill_request_count']),
+                'inference/decode_request_count': int(context_state['decode_request_count']),
             }
 
             batch_dims = self.context.batch_dimensions
