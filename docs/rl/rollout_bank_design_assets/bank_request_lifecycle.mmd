@@ -1,0 +1,28 @@
+sequenceDiagram
+    participant P as Pipeline (rank 0)
+    participant R as Token record<br/>(engine's requests dict)
+    participant G as KV cache<br/>(GPU buffers)
+    participant D as inflight-*.msgpack<br/>(disk — NEW)
+
+    Note over P,G: collection window — engine active
+    P->>R: 1. request arrives — prompt tokens stored (no KV yet)
+    R->>G: 2. prefill — KV cache built from tokens in one pass
+    loop 3. decode — one token per engine step
+        G->>G: attention reads KV, appends the new token's KV
+        G->>R: token id + logprob appended to the record
+    end
+    Note over P,G: window ends — trainer has its batch
+    G-->>R: 4. suspend — KV buffers freed, checkpoint() folds<br/>generated tokens into the prompt (tokens survive in the requests dict)
+    rect rgb(255, 205, 210)
+        R->>D: ★ 5. snapshot hook (NEW) — copy token records to disk<br/>(temp file + atomic rename, once per window)
+    end
+    Note over P,G: 6. train step — tokens idle in the requests dict
+    R->>G: 7. resume — re-admit request: prefill over prompt+tokens<br/>(same machinery as step 2)
+    Note over G: decode continues from the exact token where it stopped
+    R->>P: 8. finish (EOS / budget) — tokens + logprobs → group → ledger ①
+
+    rect rgb(255, 205, 210)
+        Note over P,D: after a 4h SIGKILL — the requests dict and GPU buffers are gone, only disk survives
+        D->>P: restart — restore reads the snapshot,<br/>re-serves the prompt with saved tokens attached
+        P->>G: re-enter at prefill (step 2) — the same move as step 7,<br/>across a process boundary
+    end

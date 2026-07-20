@@ -1,0 +1,55 @@
+digraph rollout_bank {
+    rankdir=TB;
+    compound=false;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=12, shape=box, style="rounded,filled", fillcolor="#ECECFF", color="#9370DB"];
+    edge [fontname="Helvetica", fontsize=12];
+
+    subgraph cluster_r0 {
+        label="Rank-0 process — in-memory, dies at 4h kill";
+        style="filled";
+        fillcolor="#FFFDE7";
+        color="#AAAA33";
+        { rank=same; P; IQ; I; AQ; A; OQ; C; T; Q; }
+        P  [label="stage_prepare\n(submission gate)"];
+        IQ [label="infer_queue", shape=oval];
+        I  [label="stage_infer\n(engine workers)"];
+        AQ [label="assemble_queue", shape=oval];
+        A  [label="stage_assemble\n(group buckets)"];
+        OQ [label="output_queue", shape=oval];
+        C  [label="stage_consume\n(B-reorder)"];
+        T  [label="trainer pull loop\nget_environment_rollouts"];
+        Q  [label="engine suspend()\nevery train step", fillcolor="#FFE0B2", color="#E65100"];
+        P -> IQ -> I -> AQ -> A -> OQ -> C -> T [weight=20];
+        T -> Q [style=invis, weight=20];
+    }
+
+    subgraph cluster_disk {
+        label="<save>/rollout_bank/ — Lustre, survives kill";
+        style="filled";
+        fillcolor="#E8F5E9";
+        color="#2E7D32";
+        node [shape=cylinder, fillcolor="#C8E6C9", color="#2E7D32"];
+        { rank=same; G; M; S; }
+        G  [label="groups-*.msgpack\nappend-only ledger\n(each group carries\nits prompt position)"];
+        M  [label="consumed.log\nmarkers"];
+        S  [label="inflight-*.msgpack\nquiesce snapshot"];
+    }
+
+    // Invisible edges pin the disk row below the pipeline and roughly align
+    // each file under its writer; visible edges are constraint-free so they
+    // cannot scramble the pipeline's left-to-right order.
+    A -> G [style=invis];
+    T -> M [style=invis];
+    Q -> S [style=invis];
+
+    A -> G  [label="  ① record_group\n  (write-through)\n  [GOAL 1]", penwidth=2.2, color="#333333", constraint=false];
+    T -> M  [label="  ② mark_consumed(uid, iter)\n  [restore bookkeeping]", penwidth=2.2, color="#333333", constraint=false];
+    Q -> S  [label="  ③ tokens-so-far +\n  partial groups\n  [GOALS 2+3]", penwidth=2.2, color="#E65100", constraint=false];
+
+    // Restore edges declared "forward" with dir=back so dot routes them as
+    // short arcs while the arrowhead points from disk back into the pipeline.
+    OQ -> G  [dir=back, label="  ④ restore: seed output_queue,\n  pre-charge gate\n  [GOAL 1]", style=dashed, color="#1565C0", fontcolor="#1565C0", constraint=false];
+    I -> S   [dir=back, label="  ⑤ restore: replay members,\n  continue partials\n  [GOALS 2+3]", style=dashed, color="#1565C0", fontcolor="#1565C0", constraint=false];
+    P -> G   [dir=back, label="  ⑥ restore: skip-set = banked positions;\n  re-derive floor, serve everything else\n  [restore bookkeeping]", style=dashed, color="#1565C0", fontcolor="#1565C0", constraint=false];
+}

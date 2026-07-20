@@ -1,0 +1,121 @@
+digraph cursor_tape {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [shape=plain, fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=11];
+    nodesep=0.4;
+    ranksep=0.6;
+
+    // ───────────────────────── Panel 1: at the kill ─────────────────────────
+    t1title [shape=none, fontsize=13, label=<<B>① At the 4h SIGKILL</B> — the checkpoint on disk is trained through <B>T = 41</B>; the kill lands <B>mid-window</B>:<BR/>positions 7–8 were served <I>after</I> the last ③ suspend snapshot>];
+    tape1 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6">
+      <TR>
+        <TD BORDER="0"></TD>
+        <TD BGCOLOR="#BDBDBD" PORT="c0">0<BR/><FONT POINT-SIZE="10">consumed<BR/>@41</FONT></TD>
+        <TD BGCOLOR="#BDBDBD">1<BR/><FONT POINT-SIZE="10">consumed<BR/>@41</FONT></TD>
+        <TD BGCOLOR="#BDBDBD">2<BR/><FONT POINT-SIZE="10">consumed<BR/>@42</FONT></TD>
+        <TD BGCOLOR="#BDBDBD" PORT="c3">3<BR/><FONT POINT-SIZE="10">consumed<BR/>@43</FONT></TD>
+        <TD BGCOLOR="#C8E6C9" PORT="b4">4<BR/><FONT POINT-SIZE="10">banked<BR/>group</FONT></TD>
+        <TD BGCOLOR="#FFE0B2">5<BR/><FONT POINT-SIZE="10">hole<BR/>(in flight)</FONT></TD>
+        <TD BGCOLOR="#C8E6C9">6<BR/><FONT POINT-SIZE="10">banked<BR/>group</FONT></TD>
+        <TD BGCOLOR="#FFE0B2">7<BR/><FONT POINT-SIZE="10">hole<BR/>(in flight)</FONT></TD>
+        <TD BGCOLOR="#C8E6C9" PORT="b8">8<BR/><FONT POINT-SIZE="10">banked<BR/>group</FONT></TD>
+        <TD BGCOLOR="#FFFFFF" PORT="u9">9<BR/><FONT POINT-SIZE="10">unserved</FONT></TD>
+        <TD BGCOLOR="#FFFFFF">10<BR/><FONT POINT-SIZE="10">unserved</FONT></TD>
+        <TD BGCOLOR="#FFFFFF">11<BR/><FONT POINT-SIZE="10">unserved</FONT></TD>
+      </TR>
+      <TR>
+        <TD BORDER="0" ALIGN="RIGHT"><FONT POINT-SIZE="10"><B>① ledger</B> (group banked)</FONT></TD>
+        <TD><FONT POINT-SIZE="10">✓</FONT></TD><TD><FONT POINT-SIZE="10">✓</FONT></TD>
+        <TD><FONT POINT-SIZE="10">✓</FONT></TD><TD><FONT POINT-SIZE="10">✓</FONT></TD>
+        <TD><FONT POINT-SIZE="10">✓</FONT></TD>
+        <TD BGCOLOR="#FFE0B2"><FONT POINT-SIZE="10"><B>hole</B></FONT></TD>
+        <TD><FONT POINT-SIZE="10">✓</FONT></TD>
+        <TD BGCOLOR="#FFE0B2"><FONT POINT-SIZE="10"><B>hole</B></FONT></TD>
+        <TD><FONT POINT-SIZE="10">✓</FONT></TD>
+        <TD></TD><TD></TD><TD></TD>
+      </TR>
+      <TR>
+        <TD BORDER="0" ALIGN="RIGHT"><FONT POINT-SIZE="10"><B>② consumed.log</B> (pulled @iter)</FONT></TD>
+        <TD><FONT POINT-SIZE="10">@41</FONT></TD><TD><FONT POINT-SIZE="10">@41</FONT></TD>
+        <TD><FONT POINT-SIZE="10">@42</FONT></TD><TD><FONT POINT-SIZE="10">@43</FONT></TD>
+        <TD></TD><TD></TD><TD></TD><TD></TD><TD></TD>
+        <TD></TD><TD></TD><TD></TD>
+      </TR>
+    </TABLE>>];
+    t1cons [shape=none, fontcolor="#616161", fontsize=11,
+            label=<<B>consumption frontier</B> — trainer pulled 0–3;<BR/>each pull appended <B>② mark_consumed → consumed.log</B>>];
+    t1cur  [shape=none, fontcolor="#1565C0", fontsize=11,
+            label=<<B>prompt cursor</B> (in memory, dies with the process): 9<BR/>run-ahead positions 4–8 are the <B>bank</B>>];
+    t1files [shape=box, style="filled", fillcolor="#FAFAFA", color="#9E9E9E", fontsize=11,
+             label=<nothing about the cursor is on disk — and nothing needs to be:<BR ALIGN="LEFT"/>the serve order is derivable, so restore re-derives the floor from the resume iteration<BR ALIGN="LEFT"/>and builds a <B>skip-set</B> from the ledger = banked/consumed positions {0,1,2,3,4,6,8}<BR ALIGN="LEFT"/>everything else — killed mid-flight (5, 7) or never started (9…) — is simply served in order<BR ALIGN="LEFT"/>>];
+
+    t1title -> tape1 [style=invis];
+    tape1:c3:s -> t1cons [dir=back, color="#616161"];
+    tape1:u9:s -> t1cur [dir=back, color="#1565C0"];
+    t1cur -> t1files [style=invis];
+
+    // ───────────────────────── Panel 2: restore decision ─────────────────────────
+    t2title [shape=none, fontsize=13, label=<<B>② Restart — restore filter; weights trained through T = 41</B><BR/>(markers @42, @43 &gt; T belong to erased training steps)>];
+    tape2 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="7">
+      <TR>
+        <TD BGCOLOR="#757575" PORT="d0"><FONT COLOR="white">0<BR/><FONT POINT-SIZE="10">drop:<BR/>@41 ≤ T</FONT></FONT></TD>
+        <TD BGCOLOR="#757575"><FONT COLOR="white">1<BR/><FONT POINT-SIZE="10">drop:<BR/>@41 ≤ T</FONT></FONT></TD>
+        <TD BGCOLOR="#A5D6A7" PORT="r2">2<BR/><FONT POINT-SIZE="10">restore:<BR/>@42 &gt; T</FONT></TD>
+        <TD BGCOLOR="#A5D6A7">3<BR/><FONT POINT-SIZE="10">restore:<BR/>@43 &gt; T</FONT></TD>
+        <TD BGCOLOR="#A5D6A7">4<BR/><FONT POINT-SIZE="10">restore:<BR/>no marker</FONT></TD>
+        <TD BGCOLOR="#FFCC80" PORT="h5">5<BR/><FONT POINT-SIZE="10">replay:<BR/>hole</FONT></TD>
+        <TD BGCOLOR="#A5D6A7">6<BR/><FONT POINT-SIZE="10">restore:<BR/>no marker</FONT></TD>
+        <TD BGCOLOR="#FFCC80">7<BR/><FONT POINT-SIZE="10">replay:<BR/>hole</FONT></TD>
+        <TD BGCOLOR="#A5D6A7">8<BR/><FONT POINT-SIZE="10">restore:<BR/>no marker</FONT></TD>
+        <TD BGCOLOR="#FFFFFF">9<BR/><FONT POINT-SIZE="10">—</FONT></TD>
+        <TD BGCOLOR="#FFFFFF">10<BR/><FONT POINT-SIZE="10">—</FONT></TD>
+        <TD BGCOLOR="#FFFFFF">11<BR/><FONT POINT-SIZE="10">—</FONT></TD>
+      </TR>
+    </TABLE>>];
+    t2note [shape=none, fontcolor="#2E7D32", fontsize=11,
+            label=<groups for 2, 3, 4, 6, 8 (banked via <B>①</B>) seed the new pipeline's<BR/>output_queue — the <B>④</B> restore arrow (gate pre-charged, no GPU spent);<BR/>5 and 7 are simply not in the ledger → the serve walk regenerates them>];
+
+    t1files -> t2title [style=invis];
+    t2title -> tape2 [style=invis];
+    tape2:r2:s -> t2note [dir=back, style=dashed, color="#2E7D32"];
+
+    // ───────────────────────── Panel 3: after restart ─────────────────────────
+    t3title [shape=none, fontsize=13, label=<<B>③ Resumed run</B> — holes regenerate first, then the cursor continues. No duplicates, no skips.>];
+    tape3 [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6">
+      <TR>
+        <TD BORDER="0"></TD>
+        <TD BGCOLOR="#BDBDBD">0<BR/><FONT POINT-SIZE="10">stays<BR/>consumed</FONT></TD>
+        <TD BGCOLOR="#BDBDBD">1<BR/><FONT POINT-SIZE="10">stays<BR/>consumed</FONT></TD>
+        <TD BGCOLOR="#C8E6C9">2<BR/><FONT POINT-SIZE="10">from bank<BR/>✓</FONT></TD>
+        <TD BGCOLOR="#C8E6C9">3<BR/><FONT POINT-SIZE="10">from bank<BR/>✓</FONT></TD>
+        <TD BGCOLOR="#C8E6C9">4<BR/><FONT POINT-SIZE="10">from bank<BR/>✓</FONT></TD>
+        <TD BGCOLOR="#FFB74D" PORT="g5">5<BR/><FONT POINT-SIZE="10">regen<BR/>1st</FONT></TD>
+        <TD BGCOLOR="#C8E6C9">6<BR/><FONT POINT-SIZE="10">from bank<BR/>✓</FONT></TD>
+        <TD BGCOLOR="#FFB74D">7<BR/><FONT POINT-SIZE="10">regen<BR/>2nd</FONT></TD>
+        <TD BGCOLOR="#C8E6C9">8<BR/><FONT POINT-SIZE="10">from bank<BR/>✓</FONT></TD>
+        <TD BGCOLOR="#BBDEFB" PORT="n9">9<BR/><FONT POINT-SIZE="10">cursor<BR/>3rd</FONT></TD>
+        <TD BGCOLOR="#BBDEFB">10<BR/><FONT POINT-SIZE="10">then<BR/>4th</FONT></TD>
+        <TD BGCOLOR="#BBDEFB">11<BR/><FONT POINT-SIZE="10">then<BR/>5th…</FONT></TD>
+      </TR>
+      <TR>
+        <TD BORDER="0" ALIGN="RIGHT"><FONT POINT-SIZE="9"><B>restored from → fed into</B></FONT></TD>
+        <TD><FONT POINT-SIZE="9">—</FONT></TD>
+        <TD><FONT POINT-SIZE="9">—</FONT></TD>
+        <TD BGCOLOR="#E8F5E9"><FONT POINT-SIZE="9">ledger ① →<BR/>output_queue ④</FONT></TD>
+        <TD BGCOLOR="#E8F5E9"><FONT POINT-SIZE="9">ledger ① →<BR/>output_queue ④</FONT></TD>
+        <TD BGCOLOR="#E8F5E9"><FONT POINT-SIZE="9">ledger ① →<BR/>output_queue ④</FONT></TD>
+        <TD BGCOLOR="#FFF3E0"><FONT POINT-SIZE="9">unbanked → serve<BR/>walk ⑥ → stage_prepare;<BR/>tokens: inflight ⑤</FONT></TD>
+        <TD BGCOLOR="#E8F5E9"><FONT POINT-SIZE="9">ledger ① →<BR/>output_queue ④</FONT></TD>
+        <TD BGCOLOR="#FFF3E0"><FONT POINT-SIZE="9">unbanked → serve<BR/>walk ⑥; regen<BR/>(served after last ③ —<BR/>no snapshot tokens)</FONT></TD>
+        <TD BGCOLOR="#E8F5E9"><FONT POINT-SIZE="9">ledger ① →<BR/>output_queue ④</FONT></TD>
+        <TD COLSPAN="3" BGCOLOR="#E3F2FD"><FONT POINT-SIZE="9">unbanked → same serve walk ⑥<BR/>→ stage_prepare, fresh generation</FONT></TD>
+      </TR>
+    </TABLE>>];
+    t3cur [shape=none, fontcolor="#1565C0", fontsize=11,
+           label=<the serve walk (<B>⑥</B>) starts at the derived floor, skips the skip-set {…4, 6, 8},<BR/>and serves the rest in order: 5, 7, then 9 → 10 → 11 → …>];
+
+    t2note -> t3title [style=invis];
+    t3title -> tape3 [style=invis];
+    tape3:n9:s -> t3cur [dir=back, color="#1565C0"];
+}
