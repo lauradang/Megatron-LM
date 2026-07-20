@@ -441,8 +441,8 @@ Walking through it panel by panel:
 
 - **Panel ③ — the resumed run.** The trainer's first pulls are served straight
   from the bank (positions 2, 3, 4, 6, 8). Generation restarts with the two holes
-  first (5, then 7), then the cursor resumes at 9 and advances 9 → 10 → 11 as
-  normal. The bottom row spells out each column's source and destination:
+  first (5, then 7), then the serve walk reaches the fresh positions and
+  advances 9 → 10 → 11 as normal. The bottom row spells out each column's source and destination:
   banked groups are read from the **ledger (①)** and seeded directly into
   **`output_queue` (④)** — the trainer pulls them without touching the GPU;
   unbanked positions are re-served through **`stage_prepare`** by the skip-walk
@@ -520,7 +520,7 @@ and atomically flips `MANIFEST.json`.
   only at episode end (`/verify`), so an interrupted episode has no trainable
   tokens or reward on the Megatron side. In-flight episodes always restart from
   scratch; **completed** episodes are ordinary banked groups and get full Phase A
-  benefit, and cursor persistence guarantees restarted episodes neither duplicate
+  benefit, and the skip-walk (⑥) guarantees restarted episodes neither duplicate
   nor skip prompts.
 - **Token-identical replay.** Continuations resume with a fresh sampling RNG; they
   are statistically valid samples with per-token-correct logprobs and staleness
