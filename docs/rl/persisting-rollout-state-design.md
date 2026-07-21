@@ -71,9 +71,11 @@ per-rank JSONLs (active/waiting counts + KV footprint at every suspend).
 G/G and B/B rows — flow accounting over the same per-env pipeline counters from
 the full W&B parquet history, with kill boundaries detected as counter resets
 (these runs restarted too often for timestamp gaps); engine-active approximated
-as `prepared − inferred` capped at the 2,784-slot budget, tokens via the run's
-mean trajectory length (~11.5–12.5k) — no engine JSONLs, so their engine split
-is approximate.
+as `prepared − inferred` capped at the 2,784-slot budget, tokens via the
+run-wide median trajectory length (~11.6–12k) — no engine JSONLs, so their
+engine split is approximate. The full G/G + B/B extraction is committed as
+[`rollout_bank_design_assets/bank_kill_waste_extract.py`](rollout_bank_design_assets/bank_kill_waste_extract.py)
+— runnable against W&B alone, reproduces those table rows end to end.
 
 ![Where a typical 4h job's work dies at the SLURM kill — token share and rollout headcount by recovery phase](rollout_bank_design_assets/bank_kill_waste.png)
 
@@ -88,8 +90,8 @@ queue composition skews by env trajectory length):
 
 | Where the work died | Recovered by | [G/G](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) rollouts (% of lost) | [G/G](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) tokens (% of gen) | [R/G](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) rollouts (% of lost) | [R/G](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) tokens (% of gen) | [R/B](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) rollouts (% of lost) | [R/B](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) tokens (% of gen) | [B/B](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) rollouts (% of lost) | [B/B](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) tokens (% of gen) |
 |---|---|---|---|---|---|---|---|---|---|
-| Complete groups in `output_queue` | **Phase A** (ledger ① / seed ④) | 4,319 (72%) | 51.4M (**65.2%**) | 24,272 (72%) | 81.8M (**36.0%**) | 11,696 (52%) | 53.9M (**21.0%**) | 725 (59%) | 8.9M (**12.4%**) |
-| Complete groups in B-consume reorder buffer | **Phase A** | 0 | 0 | 0 | 0 | 1,531 (7%) | 10.9M (**4.2%**) | 432 (36%) | 5.5M (**7.7%**) |
+| Complete groups in `output_queue` | **Phase A** (ledger ① / seed ④) | 4,319 (72%) | 51.4M (**65.2%**) | 24,272 (72%) | 81.8M (**36.0%**) | 11,696 (52%) | 53.9M (**21.0%**) | 714 (59%) | 8.9M (**12.5%**) |
+| Complete groups in B-consume reorder buffer | **Phase A** | 0 | 0 | 0 | 0 | 1,531 (7%) | 10.9M (**4.2%**) | 443 (37%) | 5.5M (**7.7%**) |
 | Finished members of partial groups (`_assemble_pending`) | **Phase B** (quiesce snapshot ③/⑤) | ~781 (13%) | 9.3M (**11.8%**) | ~3,164 (9%) | 25.5M (**11.3%**) | ~3,099 (14%) | 33.1M (**13.1%**) | ~50 (4%) | 0.6M (**0.9%**) |
 | Mid-decode in the engine (active; 2,784 = 4 × 696 slot cap) | **Phase C** (token-level resume) | ~887 (15%) | 5.3M (**6.7%**) | 2,784 (8%) | 26.3M (**11.7%**) | 2,784 (12%) | 26.1M (**10.3%**) | ~3 (0%) | ~0 (**~0%**) |
 | In engine waiting queue (submitted, never scheduled) | nothing to recover — skip-walk ⑥ re-serves | ~0 (0%) | ~0 (**~0%**) | 3,355 (10%) | ~0 (**~0%**) | 3,355 (15%) | ~0 (**~0%**) | 0 | 0 |
