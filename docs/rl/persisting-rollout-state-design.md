@@ -110,346 +110,246 @@ intact, at three levels of ambition:
 
 ### Architecture
 
-The bank is a rank-0 sidecar with two write paths (write-through ledger, per-window
-quiesce snapshot) and one read path (restore at startup). Three terms used
-throughout:
+The bank is a rank-0 sidecar with two write paths (write-through ledger,
+per-window quiesce snapshot) and one read path (restore at startup). Three terms
+used throughout:
 
-- A **ledger** is an append-only history: existing entries are never edited or
-  deleted, only new ones appended. A kill mid-write can only damage the final
-  record (caught by a checksum), and a recorded event can later be "undone" by
-  simply ignoring it — which is how consumption rollback works.
-- **Write-through** means data hits disk at the same moment it is created in
-  memory, so a kill can never take back completed work.
-- A **snapshot** is a point-in-time copy that atomically replaces its
-  predecessor — used for state that changes too fast to write through, at the
-  cost of losing whatever happened after the last copy.
+- **Ledger** — an append-only history. Entries are never edited or deleted; a
+  kill mid-write can only damage the final record (caught by a checksum), and a
+  recorded event can be "undone" by ignoring it (how consumption rollback works).
+- **Write-through** — data hits disk the moment it is created in memory, so a
+  kill can never take back completed work.
+- **Snapshot** — a point-in-time copy that atomically replaces its predecessor.
+  Used for state that changes too fast to write through; loses whatever happened
+  after the last copy.
 
 ![Durable rollout bank — pipeline, write-through paths, and restore paths](rollout_bank_design_assets/bank_architecture.png)
 
-**How to read the diagram.** The yellow box is the rank-0 training process:
-everything inside it is Python/GPU memory and vanishes at the 4h kill. The green
-box is a directory on Lustre: everything inside it survives. Rectangles are
-pipeline stages, ovals are the queues between them, cylinders are files. Rollouts
-flow left to right through the pipeline. Solid arrows into the green box are
-writes that happen continuously **during the run**; dashed blue arrows out of it
-are reads that happen once, **at restart**.
+**How to read the diagram.**
 
-The bracketed tags on the arrows map them to the three goals from §1:
-**Goal 1** (completed groups are never lost) is delivered by ① + ④.
-**Goals 2 and 3** (finished-but-ungrouped rollouts; token-level resume) are
-delivered by ③ + ⑤. ② and ⑥ carry no rollout data themselves — they are the
-bookkeeping that makes restore *correct*: no retraining on data the loaded
-weights already learned from, no duplicated prompts, no skipped prompts.
+- Yellow box = the rank-0 training process. Everything inside is Python/GPU
+  memory and vanishes at the 4h kill.
+- Green box = a directory on Lustre. Everything inside survives.
+- Rectangles = pipeline stages, ovals = queues, cylinders = files. Rollouts flow
+  left to right.
+- Solid arrows into the green box = writes, continuous **during the run**.
+  Dashed blue arrows out of it = reads, once **at restart**.
+- Goal tags: **Goal 1** = ① + ④; **Goals 2 and 3** = ③ + ⑤. ② and ⑥ carry no
+  rollout data — they are the bookkeeping that makes restore correct (no
+  retraining on data the loaded weights already learned, no duplicated or
+  skipped prompts).
 
-Why the ledger doesn't cover Goal 2: ① fires only when a group *completes* —
-a finished member of a still-incomplete group exists only in the assemble
-stage's in-memory bucket, and it isn't a trainer-ready rollout yet: the reward is
-computed by `build_rollout` only once the whole group assembles
-(`agent/api.py:427-433`), so at this point the member is a raw
-`InferenceResponse` (tokens + logprobs, no reward). Its restore path is also
-different — it must be re-matched to a re-served prompt and pushed through
-`build_rollout` again, not handed to the trainer directly. So all partial work,
-ungrouped members and mid-decode tokens alike, shares one home (the ③ snapshot),
-one restore path (⑤), and one loss bound (≤ 1 window).
-
-Step by step:
+Why the ledger doesn't cover Goal 2: ① fires only when a group *completes*. A
+finished member of an incomplete group is still a raw `InferenceResponse` — the
+reward is computed by `build_rollout` only once the whole group assembles
+(`agent/api.py:427-433`) — and its restore path is re-match + rebuild, not
+hand-to-trainer. So all partial work shares one home (③), one restore path (⑤),
+and one loss bound (≤ 1 window).
 
 **During the run — the write paths (solid arrows):**
 
 - **① `record_group` — on every completed group.** The moment `stage_assemble`
   has all G rollouts of a group, it appends the group to the ledger, *before*
-  handing it to `output_queue`. Write-through: finished work is on disk the
-  instant it exists, so no kill can take it back. (Groups are pydantic models —
-  the serialization already exists, `rl_utils.py:696-703`.)
+  handing it to `output_queue`. Finished work is on disk the instant it exists.
+  (Groups are pydantic models; the serialization already exists,
+  `rl_utils.py:696-703`.)
 
-- **② `mark_consumed(uid, iter)` — on every trainer pull.** One line appended to
-  `consumed.log`: "group *uid* was used at iteration *iter*". It is a marker, not
-  a delete — the group's data stays in the ledger. At restore, markers are
-  compared against the checkpoint's **trained-through step T** (the last step
-  whose gradient is in the loaded weights): a marker ≤ T is already learned —
-  genuinely used up, drop; a marker > T belongs to erased training, so the group
-  comes back. Worked example in the bookkeeping section below.
+- **② `mark_consumed(uid, iter)` — on every trainer pull.** One line to
+  `consumed.log`: "group *uid* was used at iteration *iter*". A marker, not a
+  delete — the group's data stays in the ledger. At restore, markers are compared
+  against the checkpoint's trained-through step **T**: marker ≤ T → already
+  learned, drop; marker > T → erased training, restore. (Worked example in the
+  bookkeeping section.)
 
-- **③ suspend snapshot — once per collection window.** When generation pauses for
-  the train step, the engine suspends and the pipeline freezes. One file is
-  rewritten: the in-flight partial generations — tokens-so-far per unfinished
-  request. This state changes with every decoded token, far too fast to write
-  through, so it is snapshotted at this quiet point instead; a kill mid-window
-  loses at most one window of decode progress. Full timeline in "Inside one
-  collection window" below.
+- **③ suspend snapshot — once per collection window.** When generation pauses
+  for the train step, the engine suspends and the pipeline freezes. One file is
+  rewritten: the in-flight partial generations (tokens-so-far per unfinished
+  request). Too fast-changing to write through, so a kill mid-window loses at
+  most one window of decode progress.
 
 **At restart — the restore paths (dashed blue arrows):**
 
-- **④ seed `output_queue` — restored groups cost zero generation time.**
-  Generating a group is the expensive part: G full trajectories of prefill +
-  decode on the inference engine, often minutes of GPU time per group. A banked
-  group already contains everything training needs — the finished token
-  trajectories, their logprobs, rewards, and staleness epochs — so nothing about
-  it needs to be recomputed. The restore filter reads the ledger, keeps every
-  group that is still valid (never consumed, or consumed only by rolled-back
-  training, and not too stale), and places them directly into the new pipeline's
-  `output_queue`, exactly as if they had just been assembled. The trainer's first
-  pulls are then satisfied from disk while the GPUs generate only the prompts that
-  have no banked group. Without the bank, every one of these groups is regenerated
-  from scratch after each 4h kill — that regeneration is precisely the waste this
-  design removes. The submission gate is pre-charged to count the restored groups,
-  so the run-ahead cap stays enforced.
+- **④ seed `output_queue` — restored groups cost zero generation time.** A
+  banked group already holds everything training needs (token trajectories,
+  logprobs, rewards, staleness epochs). The restore filter keeps every
+  still-valid group and places it directly into the new pipeline's
+  `output_queue`, as if just assembled. The trainer's first pulls come from
+  disk; the GPUs generate only unbanked prompts. The submission gate is
+  pre-charged for the restored groups, so the run-ahead cap stays enforced.
 
 - **⑤ continuations — interrupted generations resume mid-decode.** When the
   pipeline re-serves a prompt whose generation was cut off, the saved
   tokens-so-far are matched to it and the engine prefills prompt + saved tokens,
-  continuing from where the killed run stopped instead of from token 0
-  (Phase C; direct-inference agents only). The underlying resume-by-prefill
-  mechanism is existing engine code that already fires at every suspend — the
-  actual `suspend()`/`checkpoint()` snippets are in §3.6.
+  continuing where the killed run stopped (Phase C; direct-inference agents
+  only). The resume-by-prefill mechanism is existing engine code — snippets in
+  §3.6.
 
-- **⑥ re-serve everything unbanked — generation picks up where it left off.**
-  Nothing about the prompt cursor is persisted, because nothing needs to be: the
-  prompt order is a pure function of the training iteration, so the restarted
-  agent re-derives its starting floor, and restore hands it a **skip-set** — the
-  positions of every group that came back via ④ (plus those genuinely consumed).
-  The agent walks forward from the floor, skipping the skip-set and serving
-  everything else in order: positions killed mid-generation and positions never
-  started need the identical action — generate — so they don't even have to be
-  distinguished. Net effect: no prompt is generated twice, none is skipped, and
-  the only inputs are files the bank already has (ledger + markers).
+- **⑥ re-serve everything unbanked.** No cursor is persisted; none is needed.
+  The prompt order is a pure function of the training iteration, so the
+  restarted agent re-derives its starting floor and gets a **skip-set** (banked
+  or genuinely-consumed positions, straight from the ledger + markers). It walks
+  forward, skipping the skip-set, serving everything else in order. Positions
+  killed mid-generation and positions never started need the same action —
+  generate — so they are never distinguished.
 
 *Diagram source: `rollout_bank_design_assets/bank_architecture.dot`.*
 
 **Why write-through rather than snapshot-on-exit:** a snapshot-only design loses
-every group completed during the killed window, and windows are many minutes long
-in exactly the long-trajectory regimes this targets — and we cannot rely on any
-exit signal at all. The ledger makes completed work durable the moment it exists.
-It also covers the reorder buffer and the `WeightedMultiTask` queue *by
-construction*: anything banked-at-assembly and not yet marked consumed is
-restorable, so no queue introspection is ever needed.
+every group completed during the killed window — many minutes of work in exactly
+the long-trajectory regimes this targets — and we cannot rely on any exit signal.
+The ledger also covers the reorder buffer and `WeightedMultiTask` queue by
+construction: anything banked and not marked consumed is restorable, so no queue
+introspection is needed.
 
-### Inside one collection window: engine lifecycle, the cursor, and the suspend snapshot
+### Inside one collection window
 
-The run alternates between collection windows (engine active, trainer pulling
-rollouts) and train steps (engine suspended, pipeline frozen). This walks through
-one full cycle, step by step, including where the prompt cursor sits and exactly
-how it gets saved.
+The run alternates between collection windows (engine active, trainer pulling)
+and train steps (engine suspended, pipeline frozen). One full cycle:
 
-1. **Window opens — the engine resumes.** The trainer reaches rollout collection
-   and flips into inference mode; `engine.resume()` is called. Any requests that
-   were paused at the previous suspend are re-admitted: their KV cache was dropped
-   when the engine suspended, so the engine runs one prefill pass over
-   *prompt + tokens-generated-so-far* to rebuild it, then decoding continues from
-   the exact token where it stopped. This pause-and-resume-by-prefill machinery
-   already exists in the engine today — it is how in-flight generations survive
-   the weight update between windows. The bank reuses it across *job restarts*
-   instead of just across train steps.
+1. **Window opens — engine resumes.** Requests paused at the previous suspend are
+   re-admitted: one prefill pass over *prompt + tokens-so-far* rebuilds their KV,
+   and decode continues. This pause/resume-by-prefill machinery exists today —
+   it is how generations survive the weight update. The bank reuses it across
+   *job restarts*.
 
-2. **The agent serves prompts — this is where the cursor lives.** As the
-   submission gate frees slots, `stage_prepare` asks the agent for the next group.
-   The agent holds the env's prompt list in a fixed, reproducible order; it takes
-   the position the cursor points at, builds the group's inference request from
-   it, and increments the cursor. Note the cursor is pure in-memory bookkeeping:
-   it advances *before* the engine is involved, the engine never sees it, and the
-   bank never writes it — because the order is derivable, restore can reconstruct
-   the serve plan from the ledger alone (step ⑥ in the architecture).
+2. **The agent serves prompts.** As gate slots free, `stage_prepare` asks the
+   agent for the next group; the agent takes the dataset row its in-memory
+   cursor points at and increments the cursor. The engine never sees the cursor,
+   and the bank never writes it — the serve order is derivable (⑥).
 
-3. **The engine generates.** Each rollout's request goes over the local HTTP
-   endpoint into the engine's request queue. The scheduler admits it, runs prefill
-   to build KV for the prompt, then the decode loop produces one token per engine
-   step for every active request, appending tokens and logprobs and stamping each
-   span with the policy epoch (for staleness accounting). Requests finish by EOS
-   or length limit, and their responses flow back to the awaiting pipeline
-   coroutines.
+3. **The engine generates.** Requests go over the local HTTP endpoint; prefill
+   builds KV; the decode loop emits one token per step per active request,
+   accumulating tokens + logprobs and stamping policy-epoch spans.
 
-4. **Groups assemble and are banked (①).** `stage_assemble` buckets finished
-   rollouts by group; the moment a group is complete, it is appended to the ledger
-   and only then pushed to `output_queue`.
+4. **Groups assemble and are banked (①).** Complete groups are appended to the
+   ledger, then pushed to `output_queue`.
 
-5. **The trainer pulls; markers append (②).** The trainer takes its
-   `n_prompts` groups, appending a `mark_consumed` line per pull. Generation for
-   future batches keeps running concurrently the whole time — that concurrency is
-   the run-ahead the granularity modes exist for.
+5. **The trainer pulls; markers append (②).** Run-ahead generation continues
+   concurrently — that concurrency is what the granularity modes exist for.
 
-6. **Window closes — the engine suspends.** Once the trainer has its batch,
-   `engine.suspend()` halts the decode loop. Every unfinished request is reduced
-   to a compact record — prompt tokens, tokens generated so far, their logprobs,
-   epoch spans, and the remaining token budget — and its KV blocks are freed.
-   (This is the same record type from step 1; nothing here is new engine
-   machinery.) On the client side, the asyncio event loop stops spinning, so every
-   queue and half-built group in the pipeline freezes in place.
+6. **Window closes — engine suspends.** Every unfinished request is reduced to a
+   compact record (prompt tokens, tokens-so-far, logprobs, epoch spans, remaining
+   budget); KV blocks are freed. Client-side, the asyncio loop stops — every
+   queue and half-built group freezes in place.
 
-7. **The suspend hook writes the snapshot (③) — this is the new code.** With
-   everything frozen, rank 0: (a) asks the engine for its request records and
-   writes them to `inflight-<iter>.msgpack`; (b) fsyncs the ledger segment and
-   `consumed.log`. The snapshot file is written to a temp name and atomically
-   renamed over the previous window's file, so a kill at any instant — even
-   mid-write — leaves the previous window's snapshot intact and readable.
+7. **The suspend hook writes the snapshot (③) — the new code.** Rank 0 asks the
+   engine for its request records, writes `inflight-<iter>.msgpack` (temp file +
+   atomic rename, so a mid-write kill leaves the previous snapshot intact), and
+   fsyncs the ledger and `consumed.log`.
 
-8. **The train step runs**, then the loop returns to step 1.
+8. **The train step runs**; back to 1.
 
-**Why the cursor is never saved.** The serve order is a pure function of the
-training iteration (floor = `iteration × prompts_per_iter`, then sequential), so
-restore doesn't need any record of where the cursor stood: it re-derives the
-floor for the resume step, builds a **skip-set** from the ledger (every position
-with a valid banked group, plus positions whose consumption survives the
-rollback rule), and the agent simply walks forward serving everything not in the
-skip-set. A position killed mid-generation and a position never started need the
-identical action — generate — so restore never has to tell them apart.
-
-**What a mid-window kill actually loses.** Only the tokens decoded since the last
-suspend for requests that were still in flight — at most one window of decode
-progress. It does not lose completed groups (write-through ledger, step 4) and
-does not lose consumption history (markers, step 5). The unbanked positions are
-simply (re-)served by the skip-walk — and where the previous suspend's snapshot
-has their partial tokens, Phase C continues them instead of starting over.
+**Why the cursor is never saved:** the serve order is derivable (floor =
+`iteration × prompts_per_iter`, then sequential), so restore re-derives the
+floor, builds the skip-set from the ledger, and serves everything else. **What a
+mid-window kill loses:** only decode progress since the last suspend — completed
+groups (①) and consumption history (②) are write-through; unbanked positions are
+re-served, and where the snapshot has their partial tokens, Phase C continues
+them.
 
 ### The life of one in-flight request: tokens vs. KV cache
 
-The window walkthrough above treats "③ tokens-so-far" as a single arrow; this
-section zooms into one generation request to show why saving tokens — and never
-the KV cache — is enough. The principle: **tokens are the source of truth, and
-the KV cache is exactly what its name says — a cache**, derived data computed
-from tokens + weights, rebuildable by prefill whenever needed. KV blocks are
-gigabytes and specific to the GPU layout; token records are kilobytes — plain
-Python dataclasses of token ids, logprobs, and sampling params, held in the
-engine's `requests` dictionary (`dynamic_engine.py:316`).
+This zooms into one generation request to show why saving tokens — and never the
+KV cache — is enough. **Tokens are the source of truth; the KV cache is exactly
+what its name says, a cache**: derived from tokens + weights, rebuilt by prefill
+whenever needed. KV blocks are gigabytes and GPU-layout-specific; token records
+are kilobytes — plain Python dataclasses in the engine's `requests` dictionary
+(`dynamic_engine.py:316`).
 
 ![Life of one in-flight request — sequence diagram; red bands mark the new Phase C additions](rollout_bank_design_assets/bank_request_lifecycle.png)
 
-*Each lifeline is a place state lives: the pipeline, the token record in the
-engine's `requests` dict, the KV cache in GPU buffers, and the snapshot file on
-disk. Everything
-unshaded is existing machinery that runs today, every training step. The two
-red-shaded bands are what this design adds in Phase C: the ★ step-5 snapshot
-write, and the restore path after a kill. Diagram source:
-`rollout_bank_design_assets/bank_request_lifecycle.mmd`.*
+*Lifelines are places state lives. Unshaded = existing machinery that runs every
+training step. Red bands = Phase C's additions: the ★ snapshot write and the
+post-kill restore. Source: `rollout_bank_design_assets/bank_request_lifecycle.mmd`.*
 
-1. **Request arrives — tokens only.** The prompt is tokenized into
-   `prompt_tokens`, a small integer array stored in the request's entry in the
-   engine's `requests` dict. No KV exists yet.
+1. **Request arrives — tokens only.** The prompt is tokenized into a small
+   integer array in the request's `requests`-dict entry. No KV yet.
 
-2. **Prefill — the KV cache is built.** The scheduler admits the request and the
-   model runs one forward pass over all prompt tokens at once. For every token at
-   every layer, the attention Key/Value vectors are computed and stored in the
-   GPU KV buffers. The KV cache exists purely so decoding doesn't have to re-run
-   attention over the whole prefix for each new token — it is a recomputable
-   function of (tokens, weights), nothing more.
+2. **Prefill — KV built.** One forward pass over all prompt tokens computes and
+   stores each token's attention Key/Value vectors in GPU buffers. The KV cache
+   exists only so decode needn't re-run attention over the whole prefix per
+   token.
 
-3. **Decode — both representations grow in lockstep.** Each engine step produces
-   one new token per active request: the forward pass reads the KV cache, a token
-   is sampled, its KV vectors are appended to the GPU cache, **and** the token id
-   + logprob are appended to `generated_tokens` in the request record. At every
-   moment, the request record holds the complete history of the generation; the
-   KV cache holds the same information in its expensive GPU form.
+3. **Decode — both grow in lockstep.** Each step samples one token: its KV
+   appends to the GPU cache **and** its id + logprob append to the request
+   record. The record always holds the full history; the KV cache holds the same
+   information in expensive GPU form.
 
-4. **Window ends — suspend: KV discarded, tokens kept.** The trainer has its
-   batch; `suspend()` deallocates the KV buffers to free the GPUs for training,
-   and `record.checkpoint()` rewrites each unfinished request's record as
-   *new prompt = original prompt + tokens generated so far*, with the remaining
-   token budget. From this instant, the record in the `requests` dict is the
-   **only** surviving representation of the generation.
+4. **Window ends — suspend: KV discarded, tokens kept.** `suspend()` frees the
+   KV buffers; `record.checkpoint()` rewrites each unfinished request as *new
+   prompt = original prompt + tokens-so-far* with the remaining budget. The
+   record is now the only surviving representation.
 
-5. **★ The suspend hook saves tokens to disk — this is Phase C's new step.**
-   Immediately after suspend, the snapshot hook copies the token records out of
-   the `requests` dict into `inflight-<iter>.msgpack` on Lustre (write temp
-   file, atomic rename).
-   This is the one and only point in the whole cycle where tokens touch disk —
-   once per window, at the natural pause, never in the decode hot path.
+5. **★ The suspend hook saves tokens to disk — Phase C's new step.** The records
+   are copied to `inflight-<iter>.msgpack` (temp + atomic rename). The only
+   point where tokens touch disk: once per window, never in the decode hot path.
 
-6. **Train step runs.** The token records sit untouched in the `requests`
-   dict. *Today*, a kill
-   here (or anywhere) destroys them with the process. *With Phase C*, the disk
-   copy from step 5 survives; at most the tokens decoded since the last step-5
-   snapshot are lost.
+6. **Train step runs.** Records sit idle in the dict. *Today* a kill destroys
+   them; *with Phase C* the step-5 copy survives, losing at most the tokens
+   decoded since the last snapshot.
 
-7. **Next window — resume: KV rebuilt from tokens.** `resume()` reallocates GPU
-   buffers and re-admits each checkpointed request. Because its "prompt" is now
-   the full prefix (original prompt + generated tokens), the ordinary prefill of
-   step 2 rebuilds the entire KV cache in one pass, and decode (step 3) continues
-   from exactly the token where it stopped. Note this is the same step-2
-   machinery — resume is just prefill over a longer prompt.
+7. **Next window — resume: KV rebuilt from tokens.** Each checkpointed request
+   re-enters through ordinary prefill (step 2) over its longer prompt; decode
+   continues from the exact stopping token. Resume *is* prefill.
 
-8. **Request finishes.** On EOS or budget exhaustion, the response (tokens +
-   logprobs) leaves the engine for the pipeline, is assembled into its group, and
-   is banked by the ledger (①). The engine record is dropped and its KV freed.
+8. **Request finishes.** Tokens + logprobs return to the pipeline, join their
+   group, and hit the ledger (①). The record is dropped, its KV freed.
 
-**After a job kill + restart (Phase C's payoff):** the restore path reads the
-step-5 file; when the resumed pipeline re-serves the same prompt, the saved
-tokens are attached and submitted as *prompt = original prompt + saved tokens* —
-entering the lifecycle at step 2, exactly like step 7, just across a process
-boundary instead of a train step. The KV cache is never missed, because it was
-never the source of truth — every KV cache this request will ever have is built
-from its tokens.
+**After a kill + restart (Phase C's payoff):** restore reads the step-5 file;
+when the re-served prompt arrives, the saved tokens are attached (*prompt =
+original prompt + saved tokens*) and the request enters at step 2 — the same
+move as step 7, across a process boundary. The KV cache is never missed because
+it was never the source of truth.
 
-**The NemoGym variant — same engine lifecycle, different fate.** A NemoGym
-*turn* goes through steps 1–8 above unchanged: the gym's policy model posts to
-the same `:8294` endpoint, and inside the engine its request is indistinguishable
-from a math rollout (both reduce to `add_request(prompt_tokens,
-sampling_params)` — the choke-point proof in §3.6). What differs is the thing
-*wrapping* the request. For a direct-inference rollout, the request **is** the
-unit of value: save its tokens and you can finish it. For a gym episode, one
-request is only turn N of a conversation whose real state — the message history,
-the session, the tool sandbox — lives in the gym server processes, outside the
-diagram's yellow box entirely, and the reward exists only at `/verify` after the
-final turn:
+**The NemoGym variant — same engine lifecycle, different fate.** A gym *turn*
+goes through steps 1–8 unchanged: the gym's policy model posts to the same
+`:8294` endpoint, and inside the engine its request is indistinguishable from a
+math rollout (choke-point proof in §3.6). What differs is the wrapper. For a
+direct-inference rollout, the request **is** the unit of value — save its tokens
+and you can finish it. For a gym episode, one request is only turn N of a
+conversation whose real state (message history, session, tool sandbox) lives in
+the gym server processes, outside the yellow box, with reward only at `/verify`
+after the final turn:
 
 ![NemoGym variant of the request lifecycle — the engine part is identical; the episode around it cannot resume](rollout_bank_design_assets/bank_request_lifecycle_gym.png)
 
-*The turn's engine lifecycle is steps 1–8 unchanged; gym requests are simply not
-tagged `resumable`, so the ③ snapshot skips them. At the kill, the conversation
-and sandbox die with the gym processes — a saved turn-N partial would be useless
-without turns 1…N−1's env state — so the skip-walk ⑥ re-serves the episode's
-dataset row and it restarts at turn 1. Nothing partial had training value:
-reward is computed only at episode end. Diagram source:
+*Gym requests are not tagged `resumable`, so the ③ snapshot skips them. At the
+kill, the conversation and sandbox die with the gym processes — a saved turn-N
+partial would be useless without turns 1…N−1's env state — so the skip-walk ⑥
+re-serves the episode's dataset row and it restarts at turn 1. Source:
 `rollout_bank_design_assets/bank_request_lifecycle_gym.mmd`.*
 
 ### Bookkeeping: consumption markers and the prompt cursor
 
-The bank's data files answer "what work exists?"; two small bookkeeping streams
-answer the harder question after a restart: **"which of it is still useful, and
-where do we pick up generating?"** They track two independent pointers over the
-env's deterministic prompt order:
+The data files answer "what work exists?"; two pointers over the env's
+deterministic prompt order answer "which of it is still useful, and where does
+generation pick up?"
 
-- **The consumption frontier** — how far the *trainer* has gotten; in the
-  architecture diagram this is the ② arrow into `consumed.log`. Every time the
-  trainer pulls a group, `mark_consumed(group_uid, curr_iteration)` is appended.
-  Crucially this is a **marker, not a deletion**: the group's data stays in the
-  ledger. That matters because training itself can roll back — a restart resumes
-  from the last *model* checkpoint, which erases every step the killed run took
-  after the checkpoint's **trained-through step T**: the last step whose gradient
-  the loaded weights actually contain. All rules in this doc use T so they read
-  the intuitive way — *marker ≤ T = trained; marker > T = not trained*. (One
-  conversion note: Megatron's on-disk checkpoint label is T + 1, because it
-  stores "resume at this step" — the counter increments after each train step and
-  is saved then, `training.py:3718/3818`. The bank computes T = stored label − 1
-  once at load.) Because the marker records *which iteration* consumed the group,
-  the restore filter can distinguish "consumed by training the checkpoint
-  contains" (marker ≤ T → genuinely used up, drop) from "consumed by training
-  that no longer exists" (marker > T → effectively never consumed, restore). A
-  delete could not be undone; a marker can be ignored.
-- **The prompt cursor** — how far *generation* has gotten. Each env serves
-  prompts in a reproducible order (the NemoGym curriculum derives it from the
-  training iteration), and `stage_prepare` walks that order ahead of the
-  trainer — that run-ahead gap between the two pointers **is the bank**.
-  Crucially, the cursor is **never persisted, because it is derivable**: each
-  banked group carries its position, so at restart the agent re-derives its
-  starting floor from the resume iteration and walks forward, skipping every
-  position in the **skip-set** (banked or genuinely-consumed positions, straight
-  from the ledger + markers) and serving everything else in order. A position
-  whose rollouts were mid-flight at the kill (a **hole**) and a position never
-  started need the identical action — generate — so restore doesn't distinguish
-  them. No prompt is generated twice, none is skipped, and no cursor file exists.
+- **The consumption frontier** — how far the *trainer* got (the ② arrow into
+  `consumed.log`). Consumption is a marker, not a deletion, and it records the
+  consuming iteration. On restart, markers are judged against **T**, the
+  checkpoint's **trained-through step** — the last step whose gradient is in the
+  loaded weights: marker ≤ T → genuinely used up, drop; marker > T → that
+  training was erased, restore. A delete could not be undone; a marker can be
+  ignored. (Convention note: Megatron's on-disk checkpoint label is T + 1 — it
+  stores "resume at this step", incrementing after each train step,
+  `training.py:3718/3818`; the bank computes T = label − 1 at load.)
+
+- **The prompt cursor** — how far *generation* got. `stage_prepare` walks the
+  prompt order ahead of the trainer; the gap between the two pointers **is the
+  bank**. The cursor is never persisted because it is derivable: banked groups
+  carry their positions, so restore re-derives the floor and skip-walks (⑥). A
+  position killed mid-generation (a **hole**) and a position never started need
+  the identical action — generate.
 
 **What the cursor actually is, with real data.** An env's dataset is a JSONL
-file — one prompt per line, loaded at startup into a Python list
-(`nemo_gym_agent.py:356-365`). The cursor is a single integer attribute,
-`self._curriculum_cursor` (`nemo_gym_agent.py:425`): **a line number into that
-file**, pointing at the next prompt nobody has started yet. Serving a prompt is
-literally `self.dataset[idx % len(self.dataset)]` followed by `cursor += 1`
-(`:448-451`). Worked numbers with the math config (64 prompts/step): at training
-iteration 42 the curriculum floor is 42 × 64 = 2688 (`_next_curriculum_index`
-clamps the cursor to at least `iteration × prompts_per_iter`, `:117-119`). The
-trainer's batch consumes rows 2688–2751; run-ahead keeps serving 2752, 2753, …
-If the job dies with cursor = 2755, then rows 2688–2754 were each handed out
-(one row per *group* — all 16 rollouts of a group sample the same row) and line
-2755 is the next to serve:
+file, one prompt per line, loaded into a Python list (`nemo_gym_agent.py:356-365`).
+The cursor is one integer, `self._curriculum_cursor` (`:425`): **a line number
+into that file**. Serving is `self.dataset[idx % len(self.dataset)]` then
+`cursor += 1` (`:448-451`), with the floor clamp `cursor ≥ iteration ×
+prompts_per_iter` (`_next_curriculum_index`, `:117-121`). Worked numbers (64
+prompts/step, iteration 42 → floor 2688; run-ahead reached 2754; one row per
+group — all 16 rollouts sample the same row):
 
 ```text
 calendar_prompts.jsonl                              at the kill: cursor = 2755
@@ -461,82 +361,54 @@ calendar_prompts.jsonl                              at the kill: cursor = 2755
 2756  {"responses_create_params": {"input": ["Move Friday's review…"]}}      unserved
 
 after restart (nothing about the cursor was saved):
-  floor  = re-derived from resume iteration = 2688
+  floor    = re-derived from resume iteration = 2688
   skip-set = banked/consumed positions from the ledger = {2688 … 2753}
   serve walk: 2754 first (unbanked), then 2755, 2756, …
 ```
 
-The in-memory cursor integer dies with the process — and that's fine. The
-restart re-derives the floor (2688) and skips everything the ledger already
-accounts for, so it re-serves only 2754 (whose work was genuinely lost) and then
-continues exactly where the killed run would have. Without the skip-set, the
-restart would regenerate rows 2688–2753 — duplicates of groups already banked;
-the skip-set, not a cursor file, is what prevents that.
+The in-memory integer dies with the process — fine. The skip-set, not a cursor
+file, is what prevents re-generating rows 2688–2753 as duplicates.
 
-The worked example below shows both pointers across a kill and restart. Each row
-is the same twelve prompt positions of one env, at three moments in time:
+The worked example below shows both pointers across a kill and restart — the
+same twelve prompt positions of one env, at three moments:
 
 ![Cursor and consumption-marker movement across a kill/restart](rollout_bank_design_assets/bank_cursor_tape.png)
 
-Walking through it panel by panel:
+- **Panel ① — the moment of the kill.**
+  - Trainer pulled 0–3 (markers @41–@43); the gray *consumption frontier* sits
+    after 3. Generation ran ahead: 4/6/8 banked, 5/7 still mid-generation, the
+    blue *prompt cursor* at 9. The gap between the pointers is the bank.
+  - The two rows beneath the tape are the files: **① ledger** (banked groups),
+    **② consumed.log** (pull markers). A position moves one-way through
+    *served → banked → consumed*; a column read top-down shows how far it got.
+    Neither row ticked = mid-generation or never started — restore treats those
+    identically.
+  - The kill lands mid-window (7–8 served after the last suspend): 8's group
+    still banked (ledger is write-through), but 7's partial tokens are *not* in
+    the snapshot — that lost decode progress is the one-window bound.
+  - The job dies during step 44; the checkpoint is trained through **T = 41**.
 
-- **Panel ① — the moment of the kill.** The trainer had pulled positions 0–3, so
-  each of them has a consumption marker recording the iteration that used it
-  (@41, @41, @42, @43); the gray *consumption frontier* sits after position 3.
-  Generation had run ahead of the trainer: groups for 4, 6, and 8 finished and
-  were banked (green), while 5 and 7 were still mid-generation (orange "holes").
-  The blue *prompt cursor* stands at 9 — the next position `stage_prepare`
-  would have served. Everything between the two pointers is the run-ahead gap the
-  bank exists to preserve. The two rows beneath the tape are the bank files
-  themselves: **① the ledger** holds the banked groups, and **② consumed.log**
-  holds the pull markers with their iterations. Every position moves one-way
-  through **served → ① banked → ② consumed** (a group must finish assembling
-  before it can be banked, and must be banked before the trainer can consume
-  it — and consumption only adds a marker, never removes the ledger entry).
-  Reading a column top-down tells you how far that position got before the kill:
-  ①+② = consumed, ① only = banked run-ahead, neither = either mid-generation
-  when the job died (a **hole** — its work was lost) or never started; restore
-  treats those two identically, so it never needs to tell them apart. Note the
-  job dies while training step 44, but the loaded weights will contain training
-  only through step 41 — the checkpoint's trained-through step **T = 41**. The
-  callout beneath the tape shows the cursor story: nothing about it is on disk,
-  and nothing needs to be — the floor is re-derived from the resume iteration
-  and the banked positions come from the ledger. One nuance: the kill lands
-  mid-window, after 7–8 were served. Position 8's group still banked (the ledger
-  is write-through), but position 7's partial tokens are *not* in the in-flight
-  snapshot, since it started after the last suspend — that lost decode progress
-  is exactly the "at most one window" bound.
+- **Panel ② — the restore filter.**
+  - 0, 1: markers @41 ≤ T → stay consumed (that learning is in the weights).
+  - 2, 3: markers @42/@43 > T → **restored despite being consumed** — the steps
+    that ate them were erased. This is why consumption is a marker.
+  - 4, 6, 8: no marker → restored. 5, 7: not in the ledger → the serve walk
+    regenerates them.
+  - The five restored groups seed `output_queue` directly — zero GPU.
 
-- **Panel ② — the restore filter at restart.** The weights are trained through
-  T = 41, so steps 42–44 never happened as far as they are concerned — and the
-  resumed run's first executed step *is* 42, which needs its data back. The
-  filter walks the ledger and decides per position: 0 and 1 stay consumed
-  (markers @41 ≤ T — that learning is inside the loaded weights); 2 and 3 are
-  **restored even though they were consumed** (markers @42, @43 > T — the steps
-  that consumed them were erased; this is why consumption is a marker rather
-  than a deletion); 4, 6, 8 are restored as never-consumed; 5 and 7 are simply
-  not in the ledger, so the serve walk will regenerate them. The five restored
-  groups seed the new pipeline's `output_queue` directly — no GPU time is spent
-  on them.
-
-- **Panel ③ — the resumed run.** The trainer's first pulls are served straight
-  from the bank (positions 2, 3, 4, 6, 8). Generation restarts with the two holes
-  first (5, then 7), then the serve walk reaches the fresh positions and
-  advances 9 → 10 → 11 as normal. The bottom row spells out each column's source and destination:
-  banked groups are read from the **ledger (①)** and seeded directly into
-  **`output_queue` (④)** — the trainer pulls them without touching the GPU;
-  unbanked positions are re-served through **`stage_prepare`** by the skip-walk
-  (⑥) — position 5's partial tokens continue from the **in-flight snapshot (⑤)**
-  under Phase C, while position 7 regenerates from scratch (it started after the
-  last suspend, so no snapshot has its tokens — the one-window loss bound in
-  action); fresh positions follow in the same walk.
-  Comparing panel ③ against panel ①: every position is accounted for exactly
-  once — nothing was generated twice, nothing was skipped.
+- **Panel ③ — the resumed run.**
+  - Trainer's first pulls: 2/3/4/6/8 from the bank. Generation: holes first
+    (5, then 7), then fresh positions 9 → 10 → 11.
+  - Bottom row = source → destination per column: ledger ① → `output_queue` ④
+    for banked; skip-walk ⑥ → `stage_prepare` for unbanked (5 continues from
+    the ⑤ snapshot under Phase C; 7 regenerates — no snapshot has its tokens).
+  - Against panel ①: every position accounted for exactly once — no duplicates,
+    no skips.
 
 *Diagram source: `rollout_bank_design_assets/bank_cursor_tape.dot`.*
 
-Component-level details: the restore filter's full rule set is §3.2; the
-skip-walk hook in the NemoGym agent is §3.4.
+Component-level details: restore filter rules in §3.2; the skip-walk hook in
+§3.4.
 
 ### End-to-end: the bank files across one kill
 
@@ -574,11 +446,10 @@ serve walk: floor re-derived from resume step (row 22), skip-set from the
            (Phase C: decode continues from inflight-11's tokens), then 26, 27, …
 ```
 
-Net effect: the resumed trainer's first pulls are g22, g23, g24 straight from
-disk (zero GPU time), row 25 resumes mid-generation instead of restarting, and
-generation picks up at row 26 — no duplicates, no skips, nothing finished is
-lost. Compaction then rewrites the survivors into a fresh `gen-11/` directory
-and atomically flips `MANIFEST.json`.
+Net effect: the trainer's first pulls are g22–g24 straight from disk, row 25
+resumes mid-generation, generation picks up at row 26 — no duplicates, no skips,
+nothing finished is lost. Compaction then rewrites the survivors into a fresh
+`gen-11/` directory and atomically flips `MANIFEST.json`.
 
 ### What survives a kill
 
@@ -594,17 +465,14 @@ and atomically flips `MANIFEST.json`.
 ### Explicit non-goals
 
 - **NemoGym mid-episode resume.** A live episode's state spans three-plus
-  processes: the conversation list is coroutine-local inside the NemoGym agent
-  server, environment state is session-cookie-keyed in the resources server, and
-  SWE tasks hold a mutated Apptainer sandbox on a Ray worker. Reward is computed
-  only at episode end (`/verify`), so an interrupted episode has no trainable
-  tokens or reward on the Megatron side. In-flight episodes always restart from
-  scratch; **completed** episodes are ordinary banked groups and get full Phase A
-  benefit, and the skip-walk (⑥) guarantees restarted episodes neither duplicate
-  nor skip prompts.
-- **Token-identical replay.** Continuations resume with a fresh sampling RNG; they
-  are statistically valid samples with per-token-correct logprobs and staleness
-  epochs, not reproductions of the killed run.
+  processes (conversation in the agent server, session state in the resources
+  server, SWE sandboxes on Ray workers), and reward exists only at `/verify` —
+  an interrupted episode has no trainable tokens. In-flight episodes restart
+  from scratch; completed episodes are ordinary banked groups, and the skip-walk
+  ⑥ prevents duplicates and skips.
+- **Token-identical replay.** Continuations use a fresh sampling RNG: they are
+  statistically valid samples with per-token-correct logprobs and epochs, not
+  reproductions of the killed run.
 
 ---
 
