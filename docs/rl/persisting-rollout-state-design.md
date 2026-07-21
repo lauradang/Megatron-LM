@@ -38,25 +38,27 @@ wall-clock experiments despite better bubble utilization.
 
 ### Measured cost of the status quo
 
-Measured on the most recent R-submission runs (2026-07-17 `lagshape_nvls32ap`,
-8 nodes / 32 GPUs, 64 prompts × group 16, lag 5, gate = 6,144):
-[R/G `bl8qgebf`](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) (2 observed
-kills) and [R/B `rmunkfhb`](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb)
-(3 observed kills). Method: per-env `*_pipeline_*` queue/gate snapshots at the
-last logged step of each SLURM segment (kill boundaries found via `_timestamp`
-gaps), cross-checked against cumulative `inferred_count` − `yielded_count`
-token flow (agrees within 1–4 points); engine-side split from the
-`rl_log_inference_batch_trace` per-rank JSONLs
-(`<run_dir>/rl_logging/inference/`), which give active/waiting request counts
-and the KV footprint at every suspend boundary.
+**Headline: a typical 4h job destroys ~45–60% of every token it generates —
+and does it again every restart.**
 
-**Headline: a typical 4h job destroys ~45–60% of every token it generates.**
-R/G trains on only 40% of its generated tokens and discards ~60% at the kill
-(~134M tokens ≈ 42–64 GPU-h of the 128 GPU-h allocation, per kill); R/B trains
-on ~55% and discards ~45% (~124M tokens ≈ 24–36 GPU-h). This tax repeats every
-job: each restart rebuilds the queues from zero (the first logged step after a
-restart already shows them refilled to ~55–140M tokens), and the next kill
-destroys them again.
+| Mode | Trained on | Discarded at kill | Waste per kill |
+|---|---|---|---|
+| [R/G `bl8qgebf`](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) | 40% | ~60% | ~134M tok ≈ 42–64 GPU-h |
+| [R/B `rmunkfhb`](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) | ~55% | ~45% | ~124M tok ≈ 24–36 GPU-h |
+
+- Of a 128 GPU-h allocation — so nearly half the job's generation is thrown away.
+- The tax repeats every job: each restart rebuilds the queues from zero (the
+  first post-restart step already shows ~55–140M tokens refilled), and the next
+  kill destroys them again.
+
+**Runs:** 2026-07-17 `lagshape_nvls32ap`, 8 nodes / 32 GPUs, 64 prompts ×
+group 16, lag 5, gate = 6,144 (R/G: 2 kills, R/B: 3 kills).
+
+**Method:** per-env `*_pipeline_*` queue/gate snapshots at each SLURM segment's
+last logged step (kill boundaries from `_timestamp` gaps), cross-checked against
+`inferred_count − yielded_count` token flow (agrees within 1–4 points); engine
+split from the `rl_log_inference_batch_trace` per-rank JSONLs, giving
+active/waiting counts and KV footprint at every suspend.
 
 ![Where a typical 4h job's work dies at the SLURM kill — token share and rollout headcount by recovery phase](rollout_bank_design_assets/bank_kill_waste.png)
 
