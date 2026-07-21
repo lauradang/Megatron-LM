@@ -38,27 +38,42 @@ wall-clock experiments despite better bubble utilization.
 
 ### Measured cost of the status quo
 
-**Headline: a typical 4h job destroys ~45–60% of every token it generates —
-and does it again every restart.**
+**Headline: kills destroy 15–85% of each job's generated tokens — the more
+run-ahead a mode banks, the more each kill burns — and the tax repeats every
+restart.**
 
 | Mode | Trained on | Discarded at kill | Waste per kill |
 |---|---|---|---|
+| [G/G `mkxx5cim`](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) | ~16% | ~84% | ~65M tok — and kills were ≈hourly (crash-loop; no segment reached 4h) |
 | [R/G `bl8qgebf`](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) | 40% | ~60% | ~134M tok ≈ 42–64 GPU-h |
 | [R/B `rmunkfhb`](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) | ~55% | ~45% | ~124M tok ≈ 24–36 GPU-h |
+| [B/B `k9wstonf`](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) | ~79% | ~15–21% | ~15M tok ≈ 5–7 GPU-h |
 
-- Of a 128 GPU-h allocation — so nearly half the job's generation is thrown away.
+- The spectrum confirms the mechanism: **waste tracks banked run-ahead**
+  (B/B < R/B < R/G < G/G). Every G/G kill destroyed a full gate population —
+  ~5,986 rollouts: 4,319 banked complete + ~781 partial members + ~887
+  mid-decode — while B/B's small queues (~73 groups) are exactly why it wins
+  wall-clock today. The bank removes that trade.
+- R-mode waste is 24–64 GPU-h of each 128 GPU-h allocation, per kill.
 - The tax repeats every job: each restart rebuilds the queues from zero (the
   first post-restart step already shows ~55–140M tokens refilled), and the next
   kill destroys them again.
 
 **Runs:** 2026-07-17 `lagshape_nvls32ap`, 8 nodes / 32 GPUs, 64 prompts ×
-group 16, lag 5, gate = 6,144 (R/G: 2 kills, R/B: 3 kills).
+group 16, lag 5, gate = 6,144 (kills analyzed — G/G: 12 of 54 restarts mature,
+R/G: 2, R/B: 3, B/B: 19).
 
-**Method:** per-env `*_pipeline_*` queue/gate snapshots at each SLURM segment's
-last logged step (kill boundaries from `_timestamp` gaps), cross-checked against
-`inferred_count − yielded_count` token flow (agrees within 1–4 points); engine
-split from the `rl_log_inference_batch_trace` per-rank JSONLs, giving
-active/waiting counts and KV footprint at every suspend.
+**Method:** R rows — per-env `*_pipeline_*` queue/gate snapshots at each SLURM
+segment's last logged step (kill boundaries from `_timestamp` gaps),
+cross-checked against `inferred_count − yielded_count` token flow (agrees
+within 1–4 points); engine split from the `rl_log_inference_batch_trace`
+per-rank JSONLs (active/waiting counts + KV footprint at every suspend).
+G/G and B/B rows — flow accounting over the same per-env pipeline counters from
+the full W&B parquet history, with kill boundaries detected as counter resets
+(these runs restarted too often for timestamp gaps); engine-active approximated
+as `prepared − inferred` capped at the 2,784-slot budget, tokens via the run's
+mean trajectory length (~11.5–12.5k) — no engine JSONLs, so their engine split
+is approximate.
 
 ![Where a typical 4h job's work dies at the SLURM kill — token share and rollout headcount by recovery phase](rollout_bank_design_assets/bank_kill_waste.png)
 
@@ -78,25 +93,6 @@ vs tokens diverge because queue composition skews by env trajectory length):
 | Mid-decode in the engine (active; 2,784 = 4 × 696 slot cap) | **Phase C** (token-level resume) | 2,784 (8%) | 26.3M (**11.7%**) | 2,784 (12%) | 26.1M (**10.3%**) |
 | In engine waiting queue (submitted, never scheduled) | nothing to recover — skip-walk ⑥ re-serves | 3,355 (10%) | ~0 (**~0%**) | 3,355 (15%) | ~0 (**~0%**) |
 | **Total per kill** | | **33,575** | **~134M (~59%)** | **22,464** | **~124M (~48%)** |
-
-Three observations that shaped the phasing:
-
-- **Phases A+B recover 47% (R/G) / 38% (R/B) of each job's entire token
-  output** — fully finished work that dies only because nothing persists the
-  queues — and it is all plain `RolloutGroup`/`InferenceResponse` data with
-  zero engine or NemoGym entanglement. Phase C's harder machinery addresses a
-  further 10–12%.
-- **Rollout counts and token waste are different measures.** The engine's
-  waiting queue is 10–15% of killed rollouts but ~0% of tokens (no GPU work
-  done yet); conversely R/G's `output_queue` is 72% of the count but only 36%
-  of tokens because it accumulates the cheap short-trajectory envs' readahead,
-  while partial groups and in-flight decodes skew toward the expensive envs
-  (code_gen, workplace_assistant at ~20–24k tok/rollout).
-- **The gym-side split confirms the Phase C boundary.** At every observed
-  suspend/kill boundary, active + waiting ≈ the full 6,144 gate population and
-  the NemoGym-side count is ~0 — every in-flight rollout holds an open engine
-  request, so token-level resume at the engine (plus the §2 non-goal on gym
-  episodes) covers the entire in-flight story.
 
 (Measurement caveats: partial groups assume half-filled buckets; engine-active
 tokens are the measured KV footprint at kill, ~101–104k blocks × 256, which
@@ -147,13 +143,6 @@ used throughout:
   rollout data — they are the bookkeeping that makes restore correct (no
   retraining on data the loaded weights already learned, no duplicated or
   skipped prompts).
-
-Why the ledger doesn't cover Goal 2: ① fires only when a group *completes*. A
-finished member of an incomplete group is still a raw `InferenceResponse` — the
-reward is computed by `build_rollout` only once the whole group assembles
-(`agent/api.py:427-433`) — and its restore path is re-match + rebuild, not
-hand-to-trainer. So all partial work shares one home (③), one restore path (⑤),
-and one loss bound (≤ 1 window).
 
 **During the run — the write paths (solid arrows):**
 

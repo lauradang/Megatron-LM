@@ -24,18 +24,24 @@ CATS = [
 
 # % of job's generated tokens (trained-on = remainder; snapshot/flow drift folded in)
 tok = {
+    "G/G": [65.2, 0.0, 11.8, 6.7, 0.1],
     "R/G": [36.0, 0.0, 11.3, 11.7, 0.3],
     "R/B": [21.0, 4.2, 13.1, 10.3, 0.3],
+    "B/B": [12.4, 7.7, 0.9, 0.1, 0.1],
 }
 # % of rollouts discarded at the kill
 cnt = {
+    "G/G": [72.2, 0.0, 13.0, 14.8, 0.0],
     "R/G": [72.3, 0.0, 9.4, 8.3, 10.0],
     "R/B": [52.1, 6.8, 13.8, 12.4, 14.9],
+    "B/B": [59.2, 35.7, 4.1, 0.2, 0.0],
 }
-tok_totals = {"R/G": "~227M tok generated / job", "R/B": "~264M tok generated / job"}
-cnt_totals = {"R/G": "33,575 rollouts lost / kill", "R/B": "22,464 rollouts lost / kill"}
+tok_totals = {"G/G": "~76M tok / segment (kills ≈hourly)", "R/G": "~227M tok generated / job",
+              "R/B": "~264M tok generated / job", "B/B": "~72M tok generated / job"}
+cnt_totals = {"G/G": "5,986 rollouts lost / kill", "R/G": "33,575 rollouts lost / kill",
+              "R/B": "22,464 rollouts lost / kill", "B/B": "1,210 rollouts lost / kill"}
 
-fig, axes = plt.subplots(2, 1, figsize=(11.4, 4.9), dpi=200)
+fig, axes = plt.subplots(2, 1, figsize=(11.4, 6.6), dpi=200)
 fig.patch.set_facecolor(SURFACE)
 plt.subplots_adjust(left=0.075, right=0.985, top=0.845, bottom=0.225, hspace=0.62)
 
@@ -93,10 +99,10 @@ panel(axes[1], cnt, cnt_totals,
       "Share of rollouts discarded at the kill  (headcount)",
       with_trained=False)
 
-fig.suptitle("Where a typical 4h job's work dies at the SLURM kill",
+fig.suptitle("Where each job's work dies at the SLURM kill",
              x=0.075, y=0.975, ha="left", color=INK, fontsize=13, fontweight="bold")
 fig.text(0.075, 0.912,
-         "R/G bl8qgebf (avg of 2 kills) and R/B rmunkfhb (avg of 3 kills) · lag 5, 64×16, 32 GPUs",
+         "lag 5, 64×16, 32 GPUs · G/G mkxx5cim (12 kills), R/G bl8qgebf (2), R/B rmunkfhb (3), B/B k9wstonf (19)",
          color=INK2, fontsize=9)
 
 handles = [Patch(facecolor=NEUTRAL, edgecolor=SURFACE, label="trained on (useful output)")]
