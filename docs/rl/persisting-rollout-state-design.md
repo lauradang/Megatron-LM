@@ -36,6 +36,64 @@ forces `get_grpo_data_iterator` to regenerate everything from scratch
 modes exist to build — a major reason R/G submission currently loses to B/B in
 wall-clock experiments despite better bubble utilization.
 
+### Measured cost of the status quo
+
+Measured on the most recent R-submission runs (2026-07-17 `lagshape_nvls32ap`,
+8 nodes / 32 GPUs, 64 prompts × group 16, lag 5, gate = 6,144):
+[R/G `bl8qgebf`](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) (2 observed
+kills) and [R/B `rmunkfhb`](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb)
+(3 observed kills). Method: per-env `*_pipeline_*` queue/gate snapshots at the
+last logged step of each SLURM segment (kill boundaries found via `_timestamp`
+gaps), cross-checked against cumulative `inferred_count` − `yielded_count`
+token flow (agrees within 1–4 points); engine-side split from the
+`rl_log_inference_batch_trace` per-rank JSONLs
+(`<run_dir>/rl_logging/inference/`), which give active/waiting request counts
+and the KV footprint at every suspend boundary.
+
+**Headline: a typical 4h job destroys ~45–60% of every token it generates.**
+R/G trains on only 40% of its generated tokens and discards ~60% at the kill
+(~134M tokens ≈ 42–64 GPU-h of the 128 GPU-h allocation, per kill); R/B trains
+on ~55% and discards ~45% (~124M tokens ≈ 24–36 GPU-h). This tax repeats every
+job: each restart rebuilds the queues from zero (the first logged step after a
+restart already shows them refilled to ~55–140M tokens), and the next kill
+destroys them again.
+
+Where the destroyed work sits, per typical 4h job (averaged over kills; counts
+vs tokens diverge because queue composition skews by env trajectory length):
+
+| Where the work died | Recovered by | [R/G](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) rollouts (% of lost) | [R/G](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) tokens (% of job's gen) | [R/B](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) rollouts (% of lost) | [R/B](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) tokens (% of job's gen) |
+|---|---|---|---|---|---|
+| Complete groups in `output_queue` | **Phase A** (ledger ① / seed ④) | 24,272 (72%) | 81.8M (**36.0%**) | 11,696 (52%) | 53.9M (**21.0%**) |
+| Complete groups in B-consume reorder buffer | **Phase A** | 0 | 0 | 1,531 (7%) | 10.9M (**4.2%**) |
+| Finished members of partial groups (`_assemble_pending`) | **Phase B** (quiesce snapshot ③/⑤) | ~3,164 (9%) | 25.5M (**11.3%**) | ~3,099 (14%) | 33.1M (**13.1%**) |
+| Mid-decode in the engine (active; 2,784 = 4 × 696 slot cap) | **Phase C** (token-level resume) | 2,784 (8%) | 26.3M (**11.7%**) | 2,784 (12%) | 26.1M (**10.3%**) |
+| In engine waiting queue (submitted, never scheduled) | nothing to recover — skip-walk ⑥ re-serves | 3,355 (10%) | ~0 (**~0%**) | 3,355 (15%) | ~0 (**~0%**) |
+| **Total per kill** | | **33,575** | **~134M (~59%)** | **22,464** | **~124M (~48%)** |
+
+Three observations that shaped the phasing:
+
+- **Phases A+B recover 47% (R/G) / 38% (R/B) of each job's entire token
+  output** — fully finished work that dies only because nothing persists the
+  queues — and it is all plain `RolloutGroup`/`InferenceResponse` data with
+  zero engine or NemoGym entanglement. Phase C's harder machinery addresses a
+  further 10–12%.
+- **Rollout counts and token waste are different measures.** The engine's
+  waiting queue is 10–15% of killed rollouts but ~0% of tokens (no GPU work
+  done yet); conversely R/G's `output_queue` is 72% of the count but only 36%
+  of tokens because it accumulates the cheap short-trajectory envs' readahead,
+  while partial groups and in-flight decodes skew toward the expensive envs
+  (code_gen, workplace_assistant at ~20–24k tok/rollout).
+- **The gym-side split confirms the Phase C boundary.** At every observed
+  suspend/kill boundary, active + waiting ≈ the full 6,144 gate population and
+  the NemoGym-side count is ~0 — every in-flight rollout holds an open engine
+  request, so token-level resume at the engine (plus the §2 non-goal on gym
+  episodes) covers the entire in-flight story.
+
+(Measurement caveats: partial groups assume half-filled buckets; engine-active
+tokens are the measured KV footprint at kill, ~101–104k blocks × 256, which
+includes prompt tokens, so its generated-token share is slightly overstated;
+totals differ 1–4 points between snapshot- and flow-based accounting.)
+
 ### Goal
 
 Persist banked rollout work across job kills so a restart resumes with the bank
@@ -319,6 +377,28 @@ entering the lifecycle at step 2, exactly like step 7, just across a process
 boundary instead of a train step. The KV cache is never missed, because it was
 never the source of truth — every KV cache this request will ever have is built
 from its tokens.
+
+**The NemoGym variant — same engine lifecycle, different fate.** A NemoGym
+*turn* goes through steps 1–8 above unchanged: the gym's policy model posts to
+the same `:8294` endpoint, and inside the engine its request is indistinguishable
+from a math rollout (both reduce to `add_request(prompt_tokens,
+sampling_params)` — the choke-point proof in §3.6). What differs is the thing
+*wrapping* the request. For a direct-inference rollout, the request **is** the
+unit of value: save its tokens and you can finish it. For a gym episode, one
+request is only turn N of a conversation whose real state — the message history,
+the session, the tool sandbox — lives in the gym server processes, outside the
+diagram's yellow box entirely, and the reward exists only at `/verify` after the
+final turn:
+
+![NemoGym variant of the request lifecycle — the engine part is identical; the episode around it cannot resume](rollout_bank_design_assets/bank_request_lifecycle_gym.png)
+
+*The turn's engine lifecycle is steps 1–8 unchanged; gym requests are simply not
+tagged `resumable`, so the ③ snapshot skips them. At the kill, the conversation
+and sandbox die with the gym processes — a saved turn-N partial would be useless
+without turns 1…N−1's env state — so the skip-walk ⑥ re-serves the episode's
+dataset row and it restarts at turn 1. Nothing partial had training value:
+reward is computed only at episode end. Diagram source:
+`rollout_bank_design_assets/bank_request_lifecycle_gym.mmd`.*
 
 ### Bookkeeping: consumption markers and the prompt cursor
 

@@ -1,0 +1,16 @@
+sequenceDiagram
+    participant E as Episode loop<br/>(NemoGym server processes:<br/>conversation + tools/sandbox)
+    participant R as Token record<br/>(engine's requests dict)
+    participant G as KV cache<br/>(GPU buffers)
+    participant D as inflight-*.msgpack<br/>(disk — NEW)
+
+    Note over E: an episode = many turns — reward is computed only at /verify, at episode end
+    E->>R: turn N request — same :8294 endpoint, same steps 1–8 as above,<br/>indistinguishable inside the engine — but NOT tagged resumable
+    R->>G: prefill + decode (steps 2–3, unchanged)
+    G-->>R: tokens + logprobs accumulate
+    R->>E: turn N response returns — the conversation grows,<br/>but only in gym process memory
+    Note over E,D: suspend — the ③ snapshot hook skips untagged (gym) requests
+    rect rgb(255, 205, 210)
+        Note over E,D: 4h SIGKILL — conversation, session state, and sandbox die with the gym processes.<br/>Even a saved turn-N partial would be useless without turns 1…N−1's env state
+        D->>E: restart — nothing to attach. skip-walk ⑥ re-serves the episode's dataset row<br/>and the episode restarts at turn 1
+    end
