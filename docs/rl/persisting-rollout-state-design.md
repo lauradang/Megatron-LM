@@ -58,6 +58,13 @@ job: each restart rebuilds the queues from zero (the first logged step after a
 restart already shows them refilled to ~55–140M tokens), and the next kill
 destroys them again.
 
+![Where a typical 4h job's work dies at the SLURM kill — token share and rollout headcount by recovery phase](rollout_bank_design_assets/bank_kill_waste.png)
+
+*Top: share of each job's generated tokens (≈ generation GPU-time) — gray is
+trained on, colors are destroyed at the kill, keyed to the phase that recovers
+them. Bottom: the same loss by rollout headcount. Plot source:
+`rollout_bank_design_assets/bank_kill_waste.py`.*
+
 Where the destroyed work sits, per typical 4h job (averaged over kills; counts
 vs tokens diverge because queue composition skews by env trajectory length):
 
