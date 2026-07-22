@@ -37,27 +37,11 @@ notes = {
     "B/B": "1.31B tok · ≤21% destroyed · 19 resets (kills unverified)",
 }
 
-fig, ax = plt.subplots(figsize=(11.4, 3.4), dpi=200)
+fig, axes = plt.subplots(2, 1, figsize=(11.4, 6.2), dpi=200)
 fig.patch.set_facecolor(SURFACE)
-ax.set_facecolor(SURFACE)
-plt.subplots_adjust(left=0.075, right=0.72, top=0.80, bottom=0.24)
+plt.subplots_adjust(left=0.075, right=0.72, top=0.82, bottom=0.15, hspace=0.55)
 
 runs = list(data.keys())
-for spine in ax.spines.values():
-    spine.set_visible(False)
-ax.set_xlim(0, 2300)
-ax.set_ylim(-0.55, len(runs) - 0.45)
-ax.set_xticks(range(0, 2301, 500))
-ax.set_xticklabels([f"{v/1000:.1f}B" if v >= 1000 else f"{v}M" for v in range(0, 2301, 500)],
-                   color=MUTED, fontsize=8)
-ax.xaxis.grid(True, color=GRID, linewidth=0.8)
-ax.set_axisbelow(True)
-ax.tick_params(length=0)
-ax.set_yticks(range(len(runs)))
-ax.set_yticklabels(runs, color=INK, fontsize=10, fontweight="bold")
-ax.invert_yaxis()
-ax.set_title("Total tokens generated over the analyzed jobs — trained (gray) vs destroyed (color)",
-             loc="left", color=INK, fontsize=10.5, fontweight="bold", pad=8)
 
 
 def lum(hex_):
@@ -66,6 +50,28 @@ def lum(hex_):
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
+def style(ax, xmax, xticks, xlabels, title):
+    ax.set_facecolor(SURFACE)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xlim(0, xmax)
+    ax.set_ylim(-0.55, len(runs) - 0.45)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels, color=MUTED, fontsize=8)
+    ax.xaxis.grid(True, color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.tick_params(length=0)
+    ax.set_yticks(range(len(runs)))
+    ax.set_yticklabels(runs, color=INK, fontsize=10, fontweight="bold")
+    ax.invert_yaxis()
+    ax.set_title(title, loc="left", color=INK, fontsize=10.5, fontweight="bold", pad=8)
+
+
+# ── panel 1: absolute tokens ──
+ax = axes[0]
+style(ax, 2300, range(0, 2301, 500),
+      [f"{v/1000:.1f}B" if v >= 1000 else f"{v}M" for v in range(0, 2301, 500)],
+      "Absolute: total tokens generated over the analyzed jobs — trained (gray) vs destroyed (color)")
 for yi, run in enumerate(runs):
     left = 0.0
     segs = [(data[run][0], NEUTRAL)] + [(v, c) for (lab, c), v in zip(CATS, data[run][1:])]
@@ -82,10 +88,33 @@ for yi, run in enumerate(runs):
     ax.text(left + 25, yi, notes[run], ha="left", va="center",
             color=INK2, fontsize=8, clip_on=False)
 
+# ── panel 2: same data, share of each run's total ──
+ax = axes[1]
+style(ax, 100, range(0, 101, 20), [f"{v}%" for v in range(0, 101, 20)],
+      "Share: the same totals, normalized per run")
+for yi, run in enumerate(runs):
+    total = sum(data[run])
+    left = 0.0
+    segs = [(data[run][0], NEUTRAL)] + [(v, c) for (lab, c), v in zip(CATS, data[run][1:])]
+    for v, color in segs:
+        pct = 100.0 * v / total
+        if pct <= 0:
+            continue
+        ax.barh(yi, pct, left=left, height=0.52, color=color,
+                edgecolor=SURFACE, linewidth=2, zorder=3)
+        if pct >= 4.0:
+            ink = INK if lum(color) > 0.45 else "#ffffff"
+            ax.text(left + pct / 2, yi, f"{pct:.0f}%" if pct >= 7 else f"{pct:.0f}",
+                    ha="center", va="center", color=ink, fontsize=8.5, zorder=4)
+        left += pct
+    destroyed = 100.0 * (total - data[run][0]) / total
+    ax.text(101.2, yi, f"{destroyed:.0f}% destroyed overall", ha="left", va="center",
+            color=INK2, fontsize=8, clip_on=False)
+
 fig.suptitle("Overall run view: what each run generated and what the kills destroyed",
-             x=0.075, y=0.97, ha="left", color=INK, fontsize=13, fontweight="bold")
-fig.text(0.075, 0.885,
-         "lag 5, 64×16, 32 GPUs · pooled across each run's analyzed jobs (absolute tokens, not per kill)",
+             x=0.075, y=0.985, ha="left", color=INK, fontsize=13, fontweight="bold")
+fig.text(0.075, 0.935,
+         "lag 5, 64×16, 32 GPUs · pooled across each run's analyzed jobs — not per kill",
          color=INK2, fontsize=9)
 
 handles = [Patch(facecolor=NEUTRAL, edgecolor=SURFACE, label="trained on (useful output)")]
