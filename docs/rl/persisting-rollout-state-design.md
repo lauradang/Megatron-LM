@@ -49,11 +49,19 @@ restart.**
 | [R/B `rmunkfhb`](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) | ~55% | ~45% | ~124M tok ≈ 24–36 GPU-h |
 | [B/B `k9wstonf`](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) | ~79% | ~15–21% | ~15M tok ≈ 5–7 GPU-h |
 
-- The spectrum confirms the mechanism: **waste tracks banked run-ahead**
-  (B/B < R/B < R/G < G/G). Every G/G kill destroyed a full gate population —
-  ~5,986 rollouts: 4,319 banked complete + ~781 partial members + ~887
-  mid-decode — while B/B's small queues (~73 groups) are exactly why it wins
-  wall-clock today. The bank removes that trade.
+- The spectrum confirms the mechanism: **as a share of each job's own
+  generation, waste tracks banked run-ahead** (B/B < R/B < R/G < G/G), while
+  B/B's small queues (~73 groups) are exactly why it wins wall-clock today.
+  The bank removes that trade.
+- **Share and absolute loss rank differently.** In absolute tokens per kill:
+  R/G > R/B > G/G > B/B. R-submission gate slots release at *inference*
+  completion, so R banks grow open-loop across a 4h job (22–34k rollouts by
+  kill time); G/G's slots release at *consumption*, capping its bank at one
+  gate population — every G/G kill destroys ~5,986 rollouts (4,319 banked +
+  ~781 partial members + ~887 mid-decode) but never more. G/G's ~84% share
+  reflects its ≈hourly restarts (mostly crash-loop, not the 4h limit): short
+  segments train on little, yet the bank refills to cap within about one
+  iteration, so each death still forfeits a full bank.
 - R-mode waste is 24–64 GPU-h of each 128 GPU-h allocation, per kill.
 - The tax repeats every job: each restart rebuilds the queues from zero (the
   first post-restart step already shows ~55–140M tokens refilled), and the next
