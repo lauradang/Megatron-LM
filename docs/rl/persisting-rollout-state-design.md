@@ -38,38 +38,36 @@ wall-clock experiments despite better bubble utilization.
 
 ### Measured cost of the status quo
 
-**Headline: kills destroy 15–85% of each job's generated tokens — the more
-run-ahead a mode banks, the more each kill burns — and the tax repeats every
-restart.**
+**Headline: kills destroy 15–60% of each job's generated tokens — the more
+run-ahead a mode leaves unconsumed, the more each kill burns — and the tax
+repeats every restart.**
 
 | Mode | Trained on | Discarded at kill | Waste per kill |
 |---|---|---|---|
-| [G/G `mkxx5cim`](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) | ~16% | ~84% | ~65M tok — and kills were ≈hourly (crash-loop; no segment reached 4h) |
 | [R/G `bl8qgebf`](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) | 40% | ~60% | ~134M tok ≈ 42–64 GPU-h |
 | [R/B `rmunkfhb`](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) | ~55% | ~45% | ~124M tok ≈ 24–36 GPU-h |
+| [G/G `mkxx5cim`](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) | ~63% | ~37% | ~64M tok ≈ 20–31 GPU-h |
 | [B/B `k9wstonf`](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) | ~79% | ~15–21% | ~15M tok ≈ 5–7 GPU-h |
 
-- The spectrum confirms the mechanism: **as a share of each job's own
-  generation, waste tracks banked run-ahead** (B/B < R/B < R/G < G/G), while
-  B/B's small queues (~73 groups) are exactly why it wins wall-clock today.
-  The bank removes that trade.
-- **Share and absolute loss rank differently.** In absolute tokens per kill:
-  R/G > R/B > G/G > B/B. R-submission gate slots release at *inference*
-  completion, so R banks grow open-loop across a 4h job (22–34k rollouts by
-  kill time); G/G's slots release at *consumption*, capping its bank at one
+- **Waste tracks how open-loop the gate is, in both share and absolute terms**
+  (R/G > R/B > G/G > B/B). R-submission slots release at *inference*
+  completion, so R banks grow unbounded across a 4h job (22–34k rollouts by
+  kill time). G/G's slots release at *consumption*, capping its bank at one
   gate population — every G/G kill destroys ~5,986 rollouts (4,319 banked +
-  ~781 partial members + ~887 mid-decode) but never more. G/G's ~84% share
-  reflects its ≈hourly restarts (mostly crash-loop, not the 4h limit): short
-  segments train on little, yet the bank refills to cap within about one
-  iteration, so each death still forfeits a full bank.
+  ~781 partial members + ~887 mid-decode) but never more; sacct independently
+  confirms ~6,144 discarded per kill. B/B's small queues (~73 groups) are
+  exactly why it wins wall-clock today. The bank removes that trade.
+- **G/G's run also burned ~120 GPU-h on 14 startup-failure jobs** (Ray version
+  mismatch; gym never started, zero rollouts) — real allocation waste, but a
+  separate failure class the bank does not address.
 - R-mode waste is 24–64 GPU-h of each 128 GPU-h allocation, per kill.
 - The tax repeats every job: each restart rebuilds the queues from zero (the
   first post-restart step already shows ~55–140M tokens refilled), and the next
   kill destroys them again.
 
 **Runs:** 2026-07-17 `lagshape_nvls32ap`, 8 nodes / 32 GPUs, 64 prompts ×
-group 16, lag 5, gate = 6,144 (kills analyzed — G/G: 12 of 54 restarts mature,
-R/G: 2, R/B: 3, B/B: 19).
+group 16, lag 5, gate = 6,144 (kills analyzed — G/G: 12 mid-generation kills
+per sacct: 11× 4h TIMEOUT + 1 NVLink + 1 scancel; R/G: 2, R/B: 3, B/B: 19).
 
 **Method:** R rows — per-env `*_pipeline_*` queue/gate snapshots at each SLURM
 segment's last logged step (kill boundaries from `_timestamp` gaps),
@@ -77,11 +75,16 @@ cross-checked against `inferred_count − yielded_count` token flow (agrees
 within 1–4 points); engine split from the `rl_log_inference_batch_trace`
 per-rank JSONLs (active/waiting counts + KV footprint at every suspend).
 G/G and B/B rows — flow accounting over the same per-env pipeline counters from
-the full W&B parquet history, with kill boundaries detected as counter resets
-(these runs restarted too often for timestamp gaps); engine-active approximated
-as `prepared − inferred` capped at the 2,784-slot budget, tokens via the
-run-wide median trajectory length (~11.6–12k) — no engine JSONLs, so their
-engine split is approximate. The full G/G + B/B extraction is committed as
+the full W&B parquet history, with kill snapshots at counter resets;
+engine-active approximated as `prepared − inferred` capped at the 2,784-slot
+budget, tokens via the run-wide median trajectory length (~11.6–12k) — no
+engine JSONLs, so their engine split is approximate. Two G/G corrections from
+the sacct job table: the pipeline counters also reset *within* a job (~every
+collection), so G/G's per-job generation denominator is anchored on sacct
+(12 mid-generation kills, 120 iterations ⇒ ~9,400 trained rollouts/job) rather
+than per-segment counters; and its 14 Ray-mismatch startup failures produced
+zero rollouts (no engine ever ran) and are excluded. B/B's denominator is
+W&B-derived, so its waste share is an upper bound. The full G/G + B/B extraction is committed as
 [`rollout_bank_design_assets/bank_kill_waste_extract.py`](rollout_bank_design_assets/bank_kill_waste_extract.py)
 — runnable against W&B alone, reproduces those table rows end to end.
 
@@ -92,18 +95,17 @@ trained on, colors are destroyed at the kill, keyed to the phase that recovers
 them. Bottom: the same loss by rollout headcount. Plot source:
 `rollout_bank_design_assets/bank_kill_waste.py`.*
 
-Where the destroyed work sits, per kill (averaged over kills — R rows are
-typical 4h jobs, G/G segments were ≈hourly; counts vs tokens diverge because
-queue composition skews by env trajectory length):
+Where the destroyed work sits, per kill (averaged over kills; counts vs tokens
+diverge because queue composition skews by env trajectory length):
 
 | Where the work died | Recovered by | [G/G](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) rollouts (% of lost) | [G/G](https://wandb.ai/adlr/megatron-rl/runs/mkxx5cim) tokens (% of gen) | [R/G](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) rollouts (% of lost) | [R/G](https://wandb.ai/adlr/megatron-rl/runs/bl8qgebf) tokens (% of gen) | [R/B](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) rollouts (% of lost) | [R/B](https://wandb.ai/adlr/megatron-rl/runs/rmunkfhb) tokens (% of gen) | [B/B](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) rollouts (% of lost) | [B/B](https://wandb.ai/adlr/megatron-rl/runs/k9wstonf) tokens (% of gen) |
 |---|---|---|---|---|---|---|---|---|---|
-| Complete groups in `output_queue` | **Phase A** (ledger ① / seed ④) | 4,319 (72%) | 51.4M (**65.2%**) | 24,272 (72%) | 81.8M (**36.0%**) | 11,696 (52%) | 53.9M (**21.0%**) | 714 (59%) | 8.9M (**12.5%**) |
+| Complete groups in `output_queue` | **Phase A** (ledger ① / seed ④) | 4,319 (72%) | 50.3M (**28.8%**) | 24,272 (72%) | 81.8M (**36.0%**) | 11,696 (52%) | 53.9M (**21.0%**) | 714 (59%) | 8.9M (**12.5%**) |
 | Complete groups in B-consume reorder buffer | **Phase A** | 0 | 0 | 0 | 0 | 1,531 (7%) | 10.9M (**4.2%**) | 443 (37%) | 5.5M (**7.7%**) |
-| Finished members of partial groups (`_assemble_pending`) | **Phase B** (quiesce snapshot ③/⑤) | ~781 (13%) | 9.3M (**11.8%**) | ~3,164 (9%) | 25.5M (**11.3%**) | ~3,099 (14%) | 33.1M (**13.1%**) | ~50 (4%) | 0.6M (**0.9%**) |
-| Mid-decode in the engine (active; 2,784 = 4 × 696 slot cap) | **Phase C** (token-level resume) | ~887 (15%) | 5.3M (**6.7%**) | 2,784 (8%) | 26.3M (**11.7%**) | 2,784 (12%) | 26.1M (**10.3%**) | ~3 (0%) | ~0 (**~0%**) |
+| Finished members of partial groups (`_assemble_pending`) | **Phase B** (quiesce snapshot ③/⑤) | ~781 (13%) | 9.1M (**5.2%**) | ~3,164 (9%) | 25.5M (**11.3%**) | ~3,099 (14%) | 33.1M (**13.1%**) | ~50 (4%) | 0.6M (**0.9%**) |
+| Mid-decode in the engine (active; 2,784 = 4 × 696 slot cap) | **Phase C** (token-level resume) | ~887 (15%) | 5.2M (**3.0%**) | 2,784 (8%) | 26.3M (**11.7%**) | 2,784 (12%) | 26.1M (**10.3%**) | ~3 (0%) | ~0 (**~0%**) |
 | In engine waiting queue (submitted, never scheduled) | nothing to recover — skip-walk ⑥ re-serves | ~0 (0%) | ~0 (**~0%**) | 3,355 (10%) | ~0 (**~0%**) | 3,355 (15%) | ~0 (**~0%**) | 0 | 0 |
-| **Total per kill** | | **5,986** | **~66M (~84%)** | **33,575** | **~134M (~59%)** | **22,464** | **~124M (~48%)** | **1,210** | **~15M (~21%)** |
+| **Total per kill** | | **5,986** | **~64M (~37%)** | **33,575** | **~134M (~59%)** | **22,464** | **~124M (~48%)** | **1,210** | **~15M (~21%)** |
 
 (Measurement caveats: partial groups assume half-filled buckets; for the R rows,
 engine-active tokens are the measured KV footprint at kill, ~101–104k blocks ×

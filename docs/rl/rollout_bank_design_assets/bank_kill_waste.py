@@ -24,7 +24,7 @@ CATS = [
 
 # % of job's generated tokens (trained-on = remainder; snapshot/flow drift folded in)
 tok = {
-    "G/G": [65.2, 0.0, 11.8, 6.7, 0.1],
+    "G/G": [28.8, 0.0, 5.2, 3.0, 0.1],
     "R/G": [36.0, 0.0, 11.3, 11.7, 0.3],
     "R/B": [21.0, 4.2, 13.1, 10.3, 0.3],
     "B/B": [12.5, 7.7, 0.9, 0.1, 0.1],
@@ -36,7 +36,7 @@ cnt = {
     "R/B": [52.1, 6.8, 13.8, 12.4, 14.9],
     "B/B": [59.0, 36.6, 4.1, 0.2, 0.0],
 }
-tok_totals = {"G/G": "~76M tok / segment (kills ≈hourly)", "R/G": "~227M tok generated / job",
+tok_totals = {"G/G": "~174M tok generated / job", "R/G": "~227M tok generated / job",
               "R/B": "~264M tok generated / job", "B/B": "~72M tok generated / job"}
 cnt_totals = {"G/G": "5,986 rollouts lost / kill", "R/G": "33,575 rollouts lost / kill",
               "R/B": "22,464 rollouts lost / kill", "B/B": "1,210 rollouts lost / kill"}
@@ -102,7 +102,7 @@ panel(axes[1], cnt, cnt_totals,
 fig.suptitle("Where each job's work dies at the SLURM kill",
              x=0.075, y=0.975, ha="left", color=INK, fontsize=13, fontweight="bold")
 fig.text(0.075, 0.912,
-         "lag 5, 64×16, 32 GPUs · G/G mkxx5cim (12 kills), R/G bl8qgebf (2), R/B rmunkfhb (3), B/B k9wstonf (19)",
+         "lag 5, 64×16, 32 GPUs · G/G mkxx5cim (12 kills, sacct-anchored), R/G bl8qgebf (2), R/B rmunkfhb (3), B/B k9wstonf (19)",
          color=INK2, fontsize=9)
 
 handles = [Patch(facecolor=NEUTRAL, edgecolor=SURFACE, label="trained on (useful output)")]

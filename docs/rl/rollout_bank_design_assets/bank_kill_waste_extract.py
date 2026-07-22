@@ -18,10 +18,12 @@
 #    scan_history rejects these runs' custom step metric).
 # 2. Kill boundaries: every restart rebuilds the rank-0 rollout pipeline, so
 #    the cumulative per-env `*_pipeline_inferred_count` counters reset to
-#    zero. A drop of >64 rollouts in the summed counter marks a new SLURM
-#    segment. (Timestamp-gap detection fails for these runs: iterations take
-#    >15 min, and both runs also crash-looped, restarting far more often
-#    than the 4h limit alone would cause.)
+#    zero. A drop of >64 rollouts in the summed, forward-filled counter marks
+#    a new SLURM segment. (Timestamp-gap detection fails: iterations take
+#    >15 min. Startup-failure jobs — e.g. mkxx5cim's 14 Ray-mismatch jobs —
+#    never log pipeline rows and are invisible here, correctly contributing
+#    zero rollout waste. Cross-checked against sacct: mkxx5cim's mature
+#    segments are 4h TIMEOUTs, one NVLink failure, one scancel.)
 # 3. Per segment, the last logged row is the kill snapshot. Buckets, summed
 #    over envs (all counts in rollouts; GROUP = 16 rollouts per group):
 #      banked complete   = (output_queue_size + consume_pending_groups) * 16
@@ -36,6 +38,16 @@
 #    (~11.9-12.5k tok; per-segment last values are unreliable on short
 #    segments), with mid-decode rollouts counted at half length. Token shares are of the segment's own generation
 #    (inferred + act/2).
+#
+# G/G DENOMINATOR (important): pipeline counters also reset WITHIN a job
+# (~every collection for G/G), so per-segment `inferred` under-counts per-JOB
+# generation. This script's per-kill LOSS snapshots are correct (independently
+# confirmed by sacct: ~6,144 rollouts discarded per kill), but the G/G token
+# SHARES in the doc are anchored on the sacct job table instead: 12
+# mid-generation kills (11x 4h TIMEOUT, 1 NVLink, 1 scancel), 120 iterations
+# total => ~9.2 iters (~9,400 trained rollouts) per job, plus 14 startup-failure
+# jobs (Ray version mismatch) that produced zero rollouts. B/B's shares are
+# W&B-derived and are an upper bound on waste for the same reason.
 #
 # R-ROW PROVENANCE (not reproduced here): the R/G and R/B rows were produced
 # by the earlier analysis with the same queue/flow accounting, but with the
@@ -73,8 +85,10 @@ for label, rid in RUNS.items():
 
     inf_cols = [f"{e}_pipeline_inferred_count" for e in envs
                 if f"{e}_pipeline_inferred_count" in df.columns]
-    df["_totinf"] = df[inf_cols].sum(axis=1)
     df = df.sort_values("_timestamp").reset_index(drop=True)
+    # ffill BEFORE summing: rows where only some envs logged would otherwise
+    # sum low (NaN -> 0) and create false restart boundaries.
+    df["_totinf"] = df[inf_cols].ffill().sum(axis=1)
     seg_id = (df["_totinf"].diff() < -RESET_DROP).cumsum()
 
     kills = []
