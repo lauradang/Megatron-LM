@@ -24,16 +24,16 @@ CATS = [
 
 # % of job's generated tokens (trained-on = remainder; snapshot/flow drift folded in)
 tok = {
-    "G/G": [28.8, 0.0, 5.2, 3.0, 0.1],
     "R/G": [36.0, 0.0, 11.3, 11.7, 0.3],
     "R/B": [21.0, 4.2, 13.1, 10.3, 0.3],
+    "G/G": [28.8, 0.0, 5.2, 3.0, 0.1],
     "B/B": [12.5, 7.7, 0.9, 0.1, 0.1],
 }
 # % of rollouts discarded at the kill
 cnt = {
-    "G/G": [72.2, 0.0, 13.0, 14.8, 0.0],
     "R/G": [72.3, 0.0, 9.4, 8.3, 10.0],
     "R/B": [52.1, 6.8, 13.8, 12.4, 14.9],
+    "G/G": [72.2, 0.0, 13.0, 14.8, 0.0],
     "B/B": [59.0, 36.6, 4.1, 0.2, 0.0],
 }
 tok_totals = {"G/G": "~174M tok generated / job", "R/G": "~227M tok generated / job",
