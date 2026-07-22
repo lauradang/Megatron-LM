@@ -95,6 +95,17 @@ trained on, colors are destroyed at the kill, keyed to the phase that recovers
 them. Bottom: the same loss by rollout headcount. Plot source:
 `rollout_bank_design_assets/bank_kill_waste.py`.*
 
+The same data pooled at the run level — absolute tokens over each run's
+analyzed jobs, rather than per kill:
+
+![Overall run view — total tokens generated vs destroyed, pooled across each run's analyzed jobs](rollout_bank_design_assets/bank_kill_waste_overall.png)
+
+*Bar length = total tokens generated across the analyzed jobs (so bars differ
+by how much history each run had: G/G's 12 sacct-verified jobs vs R/G's 2).
+Destroyed totals = kills × per-kill loss; B/B's kill count is counter-derived
+and unverified, so its destroyed total is an upper bound. Plot source:
+`rollout_bank_design_assets/bank_kill_waste_overall.py`.*
+
 Where the destroyed work sits, per kill (averaged over kills; counts vs tokens
 diverge because queue composition skews by env trajectory length):
 
