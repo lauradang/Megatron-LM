@@ -6,6 +6,7 @@ import gc
 # Keep this to make the env registered.
 import itertools
 import json
+import hashlib
 import logging
 import math
 import os
@@ -2002,6 +2003,25 @@ def prep_wandb_metrics(
     def _lag(grouped_epochs):
         return [current_iteration - e for g in grouped_epochs for e in g]
 
+    def _bounded_table_key(key, limit=100):
+        """Keep a Table metric key short enough for wandb's artifact-name limit.
+
+        wandb backs a logged Table with an artifact named `run-<run_id>-<key>`
+        (special characters stripped) and hard-raises above 128 characters.
+        Long environment names blow past that -- e.g.
+        `nemo_gym:toolcall_schema_single_step_tool_use_with_argument_comparison_agent_staleness/kv_cache_...`
+        -- and because the failure happens at log time it kills the whole run
+        rather than dropping the chart. That took out two d1 chains on
+        2026-07-24 (u2d1 had never banked an iteration as a result).
+
+        Truncate deterministically and append a short hash so distinct metrics
+        keep distinct keys. Short keys are returned unchanged.
+        """
+        if len(key) <= limit:
+            return key
+        digest = hashlib.md5(key.encode()).hexdigest()[:8]
+        return f'{key[: limit - 9]}_{digest}'
+
     def _dist(prefix, values, title, native_hist=True):
         """Scalars + a Table-backed histogram chart for a 1-D list of values; also a
         native wandb.Histogram (stacks into an over-time heatmap) when native_hist.
@@ -2016,7 +2036,7 @@ def prep_wandb_metrics(
             f'{prefix}/p50': float(np.percentile(arr, 50)),
             f'{prefix}/p90': float(np.percentile(arr, 90)),
             f'{prefix}/p99': float(np.percentile(arr, 99)),
-            f'{prefix}_hist': wandb_writer.plot.histogram(
+            _bounded_table_key(f'{prefix}_hist'): wandb_writer.plot.histogram(
                 wandb_writer.Table(columns=['value'], data=[[v] for v in values]),
                 'value', title,
             ),
