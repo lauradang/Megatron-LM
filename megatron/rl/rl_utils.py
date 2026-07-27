@@ -6,6 +6,7 @@ import gc
 # Keep this to make the env registered.
 import itertools
 import json
+import hashlib
 import logging
 import math
 import os
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from string import Template
 from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
@@ -574,6 +576,47 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
+def _expand_env_config_vars(config, config_path):
+    """Expand `$VAR` / `${VAR}` references in a loaded environment config.
+
+    Dataset paths cannot use the relative-path convention that
+    `nemo_gym_config_path` uses: only `Gym/` is copied into a run's code
+    snapshot while `data/` stays in the source tree, so `dataset_file` has to
+    be absolute. Baking one cluster's absolute paths into a config that is
+    shared across clusters via git makes it silently unusable everywhere else
+    — the run dies at iteration 0 with a FileNotFoundError naming a filesystem
+    that does not exist on the cluster it is running on. That cost three users
+    a day of debugging on 2026-07-24, because the failure surfaced only as a
+    bare exit(1) per rank.
+
+    `${MRL_DATA_ROOT}` defaults to the tree containing the config, so a config
+    written against it resolves correctly on any cluster with no launcher
+    changes, and can still be overridden explicitly. Values without a `$` are
+    returned untouched, so existing absolute-path configs keep working.
+    """
+    env = dict(os.environ)
+    env.setdefault('MRL_DATA_ROOT', str(Path(config_path).resolve().parent.parent))
+
+    def _expand(value):
+        if isinstance(value, dict):
+            return {k: _expand(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_expand(v) for v in value]
+        if not isinstance(value, str) or '$' not in value:
+            return value
+        expanded = Template(value).safe_substitute(env)
+        if '$' in expanded:
+            raise ValueError(
+                f"Unresolved variable in environment config {config_path}: "
+                f"{value!r} expanded to {expanded!r}. Set the referenced "
+                f"environment variable (MRL_DATA_ROOT defaults to the tree "
+                f"containing the config)."
+            )
+        return expanded
+
+    return _expand(config)
+
+
 def get_agent(args, parallel_generation_tasks: int | None = None):
     """Get an agent based on environment configuration.
 
@@ -582,6 +625,8 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
     """
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
+
+    config = _expand_env_config_vars(config, args.langrl_env_config)
 
     return WeightedMultiTask.from_config(
         config,
@@ -1891,6 +1936,29 @@ def compute_group_stats(
 
 
 
+def _bounded_artifact_key(key, limit=100):
+    """Bound a fully-qualified metric key to wandb's artifact-name limit.
+
+    wandb backs any Table/plot value with an artifact named
+    `run-<run_id>-<sanitized key>_table` and hard-raises above 128 characters.
+    The `run-<run_id>-` prefix and `_table` suffix cost ~19 characters that the
+    caller never sees, so the key itself must stay well under 128; 100 leaves
+    margin. Sanitization only strips characters (`:`, `/`), so bounding the raw
+    key is always conservative.
+
+    Apply this to the FINAL key, after every prefix is attached. Bounding an
+    inner key before a long `env_id` is prepended does nothing -- that mistake
+    let a 128-char ValueError kill f0d3 on all three links (2026-07-26).
+
+    Truncate deterministically and append a short hash so distinct metrics keep
+    distinct keys. Short keys are returned unchanged.
+    """
+    if len(key) <= limit:
+        return key
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
+
+
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
         traj_lens: List[List[int]],
@@ -1958,6 +2026,25 @@ def prep_wandb_metrics(
     def _lag(grouped_epochs):
         return [current_iteration - e for g in grouped_epochs for e in g]
 
+    def _bounded_table_key(key, limit=100):
+        """Keep a Table metric key short enough for wandb's artifact-name limit.
+
+        wandb backs a logged Table with an artifact named `run-<run_id>-<key>`
+        (special characters stripped) and hard-raises above 128 characters.
+        Long environment names blow past that -- e.g.
+        `nemo_gym:toolcall_schema_single_step_tool_use_with_argument_comparison_agent_staleness/kv_cache_...`
+        -- and because the failure happens at log time it kills the whole run
+        rather than dropping the chart. That took out two d1 chains on
+        2026-07-24 (u2d1 had never banked an iteration as a result).
+
+        Truncate deterministically and append a short hash so distinct metrics
+        keep distinct keys. Short keys are returned unchanged.
+        """
+        if len(key) <= limit:
+            return key
+        digest = hashlib.md5(key.encode()).hexdigest()[:8]
+        return f'{key[: limit - 9]}_{digest}'
+
     def _dist(prefix, values, title, native_hist=True):
         """Scalars + a Table-backed histogram chart for a 1-D list of values; also a
         native wandb.Histogram (stacks into an over-time heatmap) when native_hist.
@@ -1972,7 +2059,7 @@ def prep_wandb_metrics(
             f'{prefix}/p50': float(np.percentile(arr, 50)),
             f'{prefix}/p90': float(np.percentile(arr, 90)),
             f'{prefix}/p99': float(np.percentile(arr, 99)),
-            f'{prefix}_hist': wandb_writer.plot.histogram(
+            _bounded_table_key(f'{prefix}_hist'): wandb_writer.plot.histogram(
                 wandb_writer.Table(columns=['value'], data=[[v] for v in values]),
                 'value', title,
             ),
@@ -2277,7 +2364,25 @@ def maybe_log_training_metrics(
             tokenizer=tokenizer,
         )
         for k, v in env_metrics.items():
-            metrics[f"{env_id}_{k}"] = v
+            # Bound the key AFTER the env prefix, not before. _bounded_table_key
+            # inside the per-env helper only ever sees the short local prefix
+            # (e.g. 'staleness/kv_cache/first_hist'); the long env_id is
+            # prepended right here, which is what actually blows wandb's
+            # 128-char artifact-name limit. Bounding early therefore never
+            # fired: f0d3 rank 63 raised
+            #   ValueError: Artifact name is longer than 128 characters:
+            #   'run-gkjlm1s0-nemo_gymtoolcall_schema_single_step_tool_use_with
+            #    _argument_comparison_agent_stalenesskv_cachefirst_hist_table-'
+            # on all three links (2026-07-26). Because the raise happens at log
+            # time on one rank, that rank exit(1)s and KillOnBadExit tears down
+            # the other 63 -- whose crash files then all show cudaErrorContained,
+            # which reads exactly like a hardware NVLink fault and is not one.
+            # Only Table/plot-backed values become artifacts; plain scalars have
+            # no length limit, so leave those keys fully readable.
+            full_key = f"{env_id}_{k}"
+            if not isinstance(v, (int, float, bool)):
+                full_key = _bounded_artifact_key(full_key)
+            metrics[full_key] = v
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0
