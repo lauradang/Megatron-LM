@@ -9,6 +9,14 @@ export NCCL_DEBUG=WARN
 
 
 
+# ATTENTION_BACKEND defaults to 'auto' rather than 'flash': flash cannot serve a
+# packed THD layout combined with context parallelism, and TE then raises
+# "No dot product attention backend is available for the provided inputs" in the
+# TRAINING forward -- i.e. after the whole rollout wave has already been
+# collected, so each occurrence costs a full iteration. 'auto' lets TE choose a
+# backend that can serve the inputs, and was validated numerically
+# (inference/training logprob abs_diff 0.0059 vs 0.0053 for flash: within noise).
+# Pin ATTENTION_BACKEND=flash for runs known to be unpacked and CP-free.
 COMMON_OPTIONS="\
     --tensor-model-parallel-size $TP  \
     --pipeline-model-parallel-size $PP  \

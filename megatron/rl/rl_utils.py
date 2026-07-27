@@ -1876,7 +1876,11 @@ def compute_group_stats(
             group_kv_first.append(kv_summary[0])
             group_kv_avg.append(kv_summary[1])
             group_kv_last.append(kv_summary[2])
-            group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
+            # completed_epochs is per-turn, so it cannot be masked per-rollout downstream
+            if rollout.trajectory:
+                group_completed_epochs.extend(
+                    turn[-1][1] for turn in rollout.policy_epoch
+                )
             group_num_evictions.append(sum(rollout.num_evictions))
             group_rollout_env_ids.append(rollout.env_id)
             group_problem_ids.append(rollout.problem_id)
@@ -1891,10 +1895,7 @@ def compute_group_stats(
         all_rollout_env_ids.append(group_rollout_env_ids)
         all_problem_ids.append(group_problem_ids)
         traj_lens.append(group_traj_lengths)
-        # Guard against an all-placeholder group (every sub-request failed, e.g.
-        # workplace_assistant prompts already exceeding seq_length at turn 1).
-        # turn_lens drives min/max/mean stats downstream; max([]) crashes.
-        turn_lens.append(group_turn_lengths or [0])
+        turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
         advantage_overrides.append(group_advantage_overrides)
@@ -1988,12 +1989,17 @@ def prep_wandb_metrics(
     ``first``/``avg``/``last`` epochs are per-rollout summaries (the ``avg`` is
     token-weighted, computed upstream in ``compute_group_stats``).
 
+    Zero-turn rollouts are a mark of placeholders (empty-trajectory pads for failed episodes).
+    Their 0.0 reward deliberately stays in the reward and group-mean/std aggregates:
+    it does affect training dynamics.
+    All other per-rollout field of theirs is masked out of stats.
+
     Args:
         wandb_writer: Wandb run to log to.
         traj_lens: Grouped list of trajectory lengths.
         turn_lens: Grouped list of turn lengths.
         rewards: Grouped list of rewards.
-        num_turns: Grouped list of number of turns in the trajectories.
+        num_turns: Grouped list of number of turns in the trajectories. Zero means failure.
         advantages: Flattened list of advantages.
         policy_first_epoch: Grouped per-rollout first-token policy epoch.
         policy_avg_epoch: Grouped per-rollout token-weighted average policy epoch.
@@ -2009,6 +2015,17 @@ def prep_wandb_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+    # Zero-turn rollouts are failure placeholders.
+    real_mask = [[nt > 0 for nt in g] for g in num_turns]
+    total_rollouts = sum(len(g) for g in num_turns)
+    failed_rollouts = sum(not keep for g in real_mask for keep in g)
+    failure_metrics = {
+        'failed_rollouts/count': failed_rollouts,
+        'failed_rollouts/ratio': (
+            failed_rollouts / total_rollouts if total_rollouts else 0.0
+        ),
+    }
+
     # All-empty wave (every gym episode failed and was dropped): there is
     # nothing to aggregate, and the stats below divide by len(advantages) and
     # take max()/min() over the reward lists. Skip rollout metrics for this
@@ -2018,13 +2035,41 @@ def prep_wandb_metrics(
             "prep_wandb_metrics: empty wave (0 usable rollouts); "
             "skipping rollout metrics this iteration."
         )
-        return {}
+        return failure_metrics
 
     def _flat(grouped):
         return [x for g in grouped for x in g]
 
+    def _real(grouped):
+        """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
+        return [
+            [x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)
+        ]
+
+    def _real_flat(grouped):
+        return [x for g in _real(grouped) for x in g]
+
     def _lag(grouped_epochs):
-        return [current_iteration - e for g in grouped_epochs for e in g]
+        return [current_iteration - e for g in _real(grouped_epochs) for e in g]
+
+    def _bounded_table_key(key, limit=100):
+        """Keep a Table metric key short enough for wandb's artifact-name limit.
+
+        wandb backs a logged Table with an artifact named `run-<run_id>-<key>`
+        (special characters stripped) and hard-raises above 128 characters.
+        Long environment names blow past that -- e.g.
+        `nemo_gym:toolcall_schema_single_step_tool_use_with_argument_comparison_agent_staleness/kv_cache_...`
+        -- and because the failure happens at log time it kills the whole run
+        rather than dropping the chart. That took out two d1 chains on
+        2026-07-24 (u2d1 had never banked an iteration as a result).
+
+        Truncate deterministically and append a short hash so distinct metrics
+        keep distinct keys. Short keys are returned unchanged.
+        """
+        if len(key) <= limit:
+            return key
+        digest = hashlib.md5(key.encode()).hexdigest()[:8]
+        return f'{key[: limit - 9]}_{digest}'
 
     def _bounded_table_key(key, limit=100):
         """Keep a Table metric key short enough for wandb's artifact-name limit.
@@ -2068,14 +2113,18 @@ def prep_wandb_metrics(
             out[f'{prefix}/histogram'] = wandb_writer.Histogram(values)
         return out
 
+    # Reward metrics include failures. All other metrics do not.
     rewards_flat = _flat(rewards)
-    traj_lens_flat = _flat(traj_lens)
+    table_rewards = _real_flat(rewards)
+    traj_lens_real = _real(traj_lens)
+    traj_lens_flat = _real_flat(traj_lens)
+    num_turns_real = _real(num_turns)
     turn_lens_flat = _flat(turn_lens)
-    evictions_flat = _flat(num_evictions)
-    env_ids_flat = _flat(env_ids)
-    problem_ids_flat = _flat(problem_ids)
+    evictions_flat = _real_flat(num_evictions)
+    env_ids_flat = _real_flat(env_ids)
+    problem_ids_flat = _real_flat(problem_ids)
 
-    # Lag = current_iteration - epoch, per rollout, by category and source.
+    # Lag = current_iteration - epoch, per real rollout, by category and source.
     policy_first = _lag(policy_first_epoch)
     policy_avg = _lag(policy_avg_epoch)
     policy_last = _lag(policy_last_epoch)
@@ -2099,7 +2148,7 @@ def prep_wandb_metrics(
             wandb_writer.Table(columns=['advantages'], data=[[x] for x in advantages]),
             'advantages', 'Advantages',
         ),
-        # One row per rollout: identity (env/problem), reward, length, evictions,
+        # One row per real rollout: identity (env/problem), reward, length, evictions,
         # and first/avg/last lag.
         'rollout_table': wandb_writer.Table(
             columns=[
@@ -2110,22 +2159,23 @@ def prep_wandb_metrics(
             ],
             data=list(zip(
                 env_ids_flat, problem_ids_flat,
-                rewards_flat, traj_lens_flat, evictions_flat,
+                table_rewards, traj_lens_flat, evictions_flat,
                 policy_first, policy_avg, policy_last,
                 kv_first, kv_avg, kv_last,
             )),
         ),
-        'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
-        'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
-        'max_turn_length': max([max(g) for g in turn_lens]),
-        'min_turn_length': min([min(g) for g in turn_lens]),
-        'mean_traj_length': np.mean([np.mean(g) for g in traj_lens]),
-        'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens]),
-        'max_traj_length': max([max(g) for g in traj_lens]),
-        'min_traj_length': min([min(g) for g in traj_lens]),
-        'mean_num_turns': np.mean([np.mean(g) for g in num_turns]),
-        'max_num_turns': max([max(g) for g in num_turns]),
-        'min_num_turns': min([min(g) for g in num_turns]),
+        # Group-level length/turn stats skip groups with all failed rollouts.
+        'mean_turn_length': np.mean([np.mean(g) for g in turn_lens if g]),
+        'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens if g]),
+        'max_turn_length': max(max(g) for g in turn_lens if g),
+        'min_turn_length': min(min(g) for g in turn_lens if g),
+        'mean_traj_length': np.mean([np.mean(g) for g in traj_lens_real if g]),
+        'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens_real if g]),
+        'max_traj_length': max(max(g) for g in traj_lens_real if g),
+        'min_traj_length': min(min(g) for g in traj_lens_real if g),
+        'mean_num_turns': np.mean([np.mean(g) for g in num_turns_real if g]),
+        'max_num_turns': max(max(g) for g in num_turns_real if g),
+        'min_num_turns': min(min(g) for g in num_turns_real if g),
         'mean_reward': np.mean([np.mean(g) for g in rewards]),
         'mean_advantage': np.mean(advantages),
         'nonzero_groups_ratio': np.count_nonzero(advantages) / len(advantages),
@@ -2134,6 +2184,7 @@ def prep_wandb_metrics(
         'mean_completion_gap': np.mean(
             [current_iteration - s for g in completed_epochs for s in g]
         ),
+        **failure_metrics,
     }
 
     # Staleness distributions: staleness/{policy|kv_cache}/{first|avg|last}/...
