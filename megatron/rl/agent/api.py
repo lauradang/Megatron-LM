@@ -73,6 +73,11 @@ class TokenRollout(AgentBaseModel):
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
+    # Distinguish a real environment result from infrastructure padding.
+    # Invalid zero-turn rollouts remain rectangular group members, but are
+    # excluded from reward normalization and contribute no gradient.
+    rollout_status: str = "ok"
+    failure_reason: str | None = None
     # When set, replaces this rollout's group-normalized advantage with a fixed
     # value (e.g. -5.0 for format violations such as tool-call syntax emitted as
     # plain text). Applied after group normalization in calculate_grpo_advantages.

@@ -726,6 +726,20 @@ class TestRLUtils:
             rtol=1e-5,
         )
 
+    def test_placeholder_rewards_do_not_affect_advantage_normalization(self):
+        rewards = [[0, 1, 0]]
+        num_turns = [[0, 1, 1]]
+        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
+        torch.testing.assert_close(
+            torch.tensor(advs),
+            torch.tensor([1.0, -1.0]),
+            atol=3e-4,
+            rtol=1e-5,
+        )
+
+    def test_all_placeholder_group_has_no_advantages(self):
+        assert rl_utils.calculate_grpo_advantages([[0, 0]], [[0, 0]]) == []
+
     def test_pad_list_of_nones(self):
         with pytest.raises(ValueError) as e_info:
             rl_utils._pad_nonnull_with_zeros([None] * 3, 42)
@@ -1147,6 +1161,8 @@ class TestRLUtils:
         # env id is shared within a group; problem/prompt id is too (GRPO group = one prompt).
         env_ids = [["gsm8k", "gsm8k"], ["math", "math"]]
         problem_ids = [["q0", "q0"], ["q1", "q1"]]
+        rollout_statuses = [["graded", "ok"], ["ok", "ok"]]
+        failure_reasons = [[None, None], [None, None]]
         current_iteration = 6
         if inject_placeholders:
             for lst, sentinel in (
@@ -1164,6 +1180,12 @@ class TestRLUtils:
             for group in problem_ids:
                 group.append("placeholder")
             problem_ids.append(["placeholder", "placeholder"])
+            for group in rollout_statuses:
+                group.append("placeholder")
+            rollout_statuses.append(["placeholder", "placeholder"])
+            for group in failure_reasons:
+                group.append("http_500")
+            failure_reasons.append(["http_500", "http_500"])
             # Placeholders contribute no turns, and compute_group_stats already
             # excludes them from completed_epochs; the failed group adds empty
             # inner lists, which the group-level stats must skip, not crash on.
@@ -1188,10 +1210,19 @@ class TestRLUtils:
             num_evictions=num_evictions,
             env_ids=env_ids,
             problem_ids=problem_ids,
+            rollout_statuses=rollout_statuses,
+            failure_reasons=failure_reasons,
             current_iteration=current_iteration,
         )
         assert metrics["failed_rollouts/count"] == (4 if inject_placeholders else 0)
         assert metrics["failed_rollouts/ratio"] == (0.5 if inject_placeholders else 0.0)
+        assert metrics["rollout/placeholder_count"] == (4 if inject_placeholders else 0)
+        assert metrics["rollout/placeholder_rate"] == (0.5 if inject_placeholders else 0.0)
+        assert metrics["rollout/graded_count"] == 1
+        assert metrics["rollout/graded_rate"] == (0.125 if inject_placeholders else 0.25)
+        assert metrics["rollout/valid_mean_reward"] == 0.75
+        if inject_placeholders:
+            assert metrics["rollout/failure_reason/http_500"] == 4
         # Reward aggregates keep the placeholder zeros by design: group means
         # become [2/3, 1/3, 0] instead of [1, 0.5].
         assert np.isclose(metrics["mean_reward"], 1 / 3 if inject_placeholders else 0.75)
@@ -1204,7 +1235,7 @@ class TestRLUtils:
         assert len(rollout_table_calls) == 1
         rows = rollout_table_calls[0].kwargs["data"]
         assert [r[1] for r in rows] == ["q0", "q0", "q1", "q1"]
-        assert [r[5] for r in rows] == [2, 4, 1, 6]  # policy_first lag column
+        assert [r[7] for r in rows] == [2, 4, 1, 6]  # policy_first lag column
         assert metrics["nonzero_groups_ratio"] == 0.5
         assert metrics["max_traj_length"] == 3
         assert metrics["min_traj_length"] == 1
