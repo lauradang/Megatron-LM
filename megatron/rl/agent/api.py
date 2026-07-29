@@ -18,13 +18,9 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+from ..inflight_tracker import add_inflight, remove_inflight
 from ..rollout_bank import RolloutBank
-from ..rollout_granularity import (
-    RELEASE_STATE_BY_SUBMISSION,
-    ConsumptionGranularity,
-    ReleaseState,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 from ..types import AgentBaseModel, Rollout, RolloutGroup, TokenRollout
 
 

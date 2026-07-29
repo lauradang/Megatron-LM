@@ -818,7 +818,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         # Attach the durable bank so stage_assemble writes each completed group
         # through to disk (no-op when the bank is disabled / non-rank-0).
         request = GroupedRolloutRequest(
-            num_groups=num_groups,
+            num_groups=n_prompts,
             streaming=streaming,
             rollouts_per_group=effective_rollouts_per_group,
             inference_interface=inference_interface,
@@ -960,7 +960,7 @@ def get_environment_rollouts(
                     # These groups are now consumed into the training batch: they
                     # leave the in-flight set (decrement here, where consumption is final,
                     # so buffered groups awaiting their batch peers stay counted).
-                    for group in rollouts:
+                    for group in fresh:
                         remove_inflight(len(group))
                     # Restored groups first, then freshly generated ones.
                     rollouts = list(inject) + fresh
