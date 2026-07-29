@@ -21,7 +21,7 @@ from ..inference import (
 from ..inflight_tracker import add_inflight, remove_inflight
 from ..rollout_bank import RolloutBank
 from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
-from ..types import AgentBaseModel, Rollout, RolloutGroup, TokenRollout
+from ..types import AgentBaseModel, GroupedRollouts, Rollout, RolloutGroup, Rollouts, TokenRollout
 
 
 # TODO: Move these models to ``megatron.rl.types`` after moving ``Request``,
