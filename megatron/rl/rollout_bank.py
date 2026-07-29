@@ -13,13 +13,13 @@ Layout (single-writer, rank-0 only, on Lustre)::
 
     <bank_dir>/
         MANIFEST.json                 # {"trained_through", "segments", "compacted_at"}
+        consumed.log                  # append-only markers {"uid", "iter"} on trainer pull
         gen-<iter>/
             ledger.log                # append-only JSONL, one self-describing index
                                       # record per completed group (+ per-record checksum)
             tokens.bin                # int32 token ids (offset-indexed sidecar)
             logprobs.bin              # fp16 generation logprobs (offset-indexed sidecar)
             masks.bin                 # uint8 generation masks (offset-indexed sidecar)
-            consumed.log              # append-only markers {"uid", "iter"} on trainer pull
 
 Why sidecars: the production ``TokenRollout`` carries a token id and a logprob per
 generated token; as JSON text that is ~28 B/token (logprobs alone ~18 B, ~9x their
@@ -187,6 +187,10 @@ class RolloutBank:
     def _manifest_path(self) -> str:
         return os.path.join(self.bank_dir, _MANIFEST)
 
+    @property
+    def _consumed_path(self) -> str:
+        return os.path.join(self.bank_dir, _CONSUMED)
+
     def _read_manifest(self) -> Manifest:
         try:
             with open(self._manifest_path) as f:
@@ -213,7 +217,7 @@ class RolloutBank:
         seg = _segment_name(iteration)
         self._seg_dir = os.path.join(self.bank_dir, seg)
         os.makedirs(self._seg_dir, exist_ok=True)
-        self._seq = 0
+        self._seq = self._next_sequence(self._seg_dir, seg)
         self._tok_off = self._file_size(_TOKENS_BIN)
         self._lp_off = self._file_size(_LOGPROBS_BIN)
         self._mask_off = self._file_size(_MASKS_BIN)
@@ -221,6 +225,15 @@ class RolloutBank:
         if seg not in manifest["segments"]:
             manifest["segments"].append(seg)
             self._write_manifest_atomic(manifest)
+
+    def _next_sequence(self, seg_dir: str, seg: str) -> int:
+        """Return the next unused sequence number in ``seg``."""
+        next_seq = 0
+        for record in self._read_ledger(seg_dir):
+            uid_seg, separator, uid_seq = record.get("uid", "").partition("/")
+            if separator and uid_seg == seg and uid_seq.isdigit():
+                next_seq = max(next_seq, int(uid_seq) + 1)
+        return next_seq
 
     def _file_size(self, name: str) -> int:
         path = os.path.join(self._seg_dir, name)
@@ -236,15 +249,21 @@ class RolloutBank:
         self._close_handles()
 
     # ---------------------------------------------------------------- append
-    def append(self, group: "RolloutGroup") -> str:
+    def append(self, group: "RolloutGroup", uid: str | None = None) -> str:
         """Write-through one completed group; return its stable uid.
 
-        The uid is assigned here and attached to the group by the caller
-        so the consume side can mark it consumed.
+        A uid is assigned for a new group or preserved when rewriting an
+        existing group during compaction.
         """
         assert self._seg_dir is not None, "set_collection() must be called before append()"
-        uid = f"{_segment_name(self._collection_iter)}/{self._seq}"
-        self._seq += 1
+        current_seg = _segment_name(self._collection_iter)
+        if uid is None:
+            uid = f"{current_seg}/{self._seq}"
+            self._seq += 1
+        else:
+            uid_seg, separator, uid_seq = uid.partition("/")
+            if separator and uid_seg == current_seg and uid_seq.isdigit():
+                self._seq = max(self._seq, int(uid_seq) + 1)
 
         record, tok_bytes, lp_bytes, mask_bytes = self._encode(group, uid)
         # Write sidecar slices first, then the index record that points at them,
@@ -379,11 +398,8 @@ class RolloutBank:
         """
         if not uid:
             return
-        seg = uid.split("/", 1)[0]
-        seg_dir = os.path.join(self.bank_dir, seg)
-        os.makedirs(seg_dir, exist_ok=True)
         marker: ConsumedMarker = {"uid": uid, "iter": iteration}
-        with open(os.path.join(seg_dir, _CONSUMED), "a") as f:
+        with open(self._consumed_path, "a") as f:
             f.write(json.dumps(marker, separators=(",", ":")) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -393,9 +409,11 @@ class RolloutBank:
         self._close_handles()  # flush any active writer before reading
         manifest = self._read_manifest()
         restored: list["RolloutGroup"] = []
+        markers = self._read_markers(self.bank_dir)
         for seg in manifest["segments"]:
             seg_dir = os.path.join(self.bank_dir, seg)
-            markers = self._read_markers(seg_dir)
+            for uid, iteration in self._read_markers(seg_dir).items():
+                markers[uid] = max(markers.get(uid, iteration), iteration)
             for record in self._read_ledger(seg_dir):
                 uid = record["uid"]
                 marker_iter = markers.get(uid)
@@ -408,14 +426,14 @@ class RolloutBank:
 
     def _read_markers(self, seg_dir: str) -> dict:
         """
-        Load consumption markers for a segment.
+        Load consumption markers from a directory.
         A marker records that the trainer pulled a group (``uid``) at some
         training iteration (``iter``). Markers live as append-only JSONL in
         ``consumed.log`` and are never deleted; this method collapses them to
         ``uid -> latest (max) consumed iteration`` for ``restore``.
 
         Args:
-            seg_dir: The directory of the segment.
+            seg_dir: The bank or legacy segment directory containing the markers.
 
         Returns:
             A dictionary of {uid: latest (max) consumed iteration for this segment}.
@@ -611,7 +629,7 @@ class RolloutBank:
         self._ledger_f = self._tok_f = self._lp_f = self._mask_f = None
         try:
             for group in groups:
-                self.append(group)  # reuses the write-through encoder + fsync
+                self.append(group, uid=group.uid)  # reuses the write-through encoder + fsync
         finally:
             self._close_handles()
             (self._seg_dir, self._collection_iter, self._seq,

@@ -17,7 +17,14 @@ import pytest
 
 from megatron.rl import rollout_bank
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
-from megatron.rl.rollout_bank import _LEDGER, _MANIFEST, _TOKENS_BIN, RolloutBank, _segment_name
+from megatron.rl.rollout_bank import (
+    _CONSUMED,
+    _LEDGER,
+    _MANIFEST,
+    _TOKENS_BIN,
+    RolloutBank,
+    _segment_name,
+)
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
 from megatron.rl.types import TokenRollout as SharedTokenRollout
@@ -212,6 +219,37 @@ class TestMarkerFilter:
 
 
 class TestCompaction:
+    def test_marker_after_compaction_is_not_orphaned(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        old_uid = bank.append(sample_group())
+
+        bank.checkpoint(2)
+        bank.mark_consumed(old_uid, 4)
+
+        assert bank.restore(2)[0].uid == old_uid
+        assert bank.restore(4) == []
+
+    def test_fresh_append_after_compaction_has_unique_uid(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(2)
+        survivor_uid = bank.append(sample_group())
+
+        bank.checkpoint(2)
+        fresh_uid = bank.append(sample_group())
+
+        assert fresh_uid != survivor_uid
+        assert {group.uid for group in bank.restore(2)} == {survivor_uid, fresh_uid}
+
+    def test_restore_reads_legacy_segment_marker(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(1)
+        uid = bank.append(sample_group())
+        bank.mark_consumed(uid, 1)
+        os.replace(tmp_path / _CONSUMED, tmp_path / _segment_name(1) / _CONSUMED)
+
+        assert RolloutBank(str(tmp_path)).restore(1) == []
+
     def test_compaction_prunes_and_flips_manifest(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(1)
