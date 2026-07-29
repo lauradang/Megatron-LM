@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import itertools
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -258,6 +260,108 @@ class TestRLUtils:
         assert captured["request"].num_groups == n_prompts
         assert captured["request"].streaming == rl_partial_rollouts
         assert captured["request"].submission_granularity == submission_granularity
+
+    @pytest.mark.parametrize(
+        "rl_partial_rollouts, restored_count, expected_request_num_groups",
+        [
+            pytest.param(True, 3, 8, id="streaming_keeps_trainer_batch"),
+            pytest.param(True, 8, 8, id="fully_restored_streaming_keeps_generator"),
+            pytest.param(False, 3, 5, id="non_streaming_generates_only_fresh"),
+            pytest.param(False, 8, None, id="fully_restored_skips_generator"),
+        ],
+    )
+    def test_restored_groups_set_generator_batch_by_lifecycle(
+        self,
+        monkeypatch,
+        rl_partial_rollouts,
+        restored_count,
+        expected_request_num_groups,
+    ):
+        """Restarts preserve persistent batches without overproducing one-shot batches."""
+
+        class Group(list):
+            def __init__(self, uid):
+                super().__init__([object()])
+                self.uid = uid
+
+        n_prompts = 8
+        restored = [Group(f"restored-{i}") for i in range(restored_count)]
+        generated = [Group(f"fresh-{i}") for i in range(n_prompts - len(restored))]
+        runtime_state = SimpleNamespace(
+            bank_restored=False,
+            restored_groups=deque(),
+        )
+
+        class Bank:
+            def set_collection(self, iteration):
+                assert iteration == 11
+
+            def restore(self, iteration):
+                assert iteration == 10
+                return restored
+
+            def mark_consumed(self, uid, iteration):
+                assert uid
+                assert iteration == 11
+
+        async def generator():
+            for group in generated:
+                yield group
+
+        captured = {}
+
+        def get_rollout_generator(_args, _interface, request_num_groups, samples_per_group):
+            captured["request_num_groups"] = request_num_groups
+            captured["samples_per_group"] = samples_per_group
+            return generator()
+
+        args = SimpleNamespace(
+            rl_offload_optimizer_during_inference=False,
+            cuda_graph_impl=None,
+            curr_iteration=11,
+            iteration=10,
+            rl_shared_prefix_log_metrics=False,
+            rl_partial_rollouts=rl_partial_rollouts,
+        )
+        pg_collection = SimpleNamespace(ep=object(), tp=object())
+        loop = asyncio.new_event_loop()
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr(rl_utils, "get_attr_wrapped_model", lambda *args, **kwargs: pg_collection)
+        monkeypatch.setattr(rl_utils, "get_pg_size", lambda _group: 1)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(
+            rl_utils,
+            "megatron_rl_inference_mode",
+            lambda *args, **kwargs: nullcontext(ReturnsRaw()),
+        )
+        monkeypatch.setattr(rl_utils, "get_rl_runtime_state", lambda: runtime_state)
+        monkeypatch.setattr(rl_utils, "maybe_get_rollout_bank", lambda _args: Bank())
+        monkeypatch.setattr(rl_utils, "get_rollout_generator", get_rollout_generator)
+        monkeypatch.setattr(rl_utils, "remove_inflight", lambda _count: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda *args, **kwargs: None)
+
+        try:
+            result = rl_utils.get_environment_rollouts(
+                model=[object()],
+                inference_model=None,
+                optimizer=object(),
+                n_prompts=n_prompts,
+                samples_per_group=4,
+            )
+        finally:
+            loop.close()
+
+        assert result == restored + generated
+        if expected_request_num_groups is None:
+            assert captured == {}
+        else:
+            assert captured == {
+                "request_num_groups": expected_request_num_groups,
+                "samples_per_group": 4,
+            }
 
     @pytest.mark.parametrize(
         "overrides, match",

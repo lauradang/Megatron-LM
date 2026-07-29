@@ -940,10 +940,17 @@ def get_environment_rollouts(
             n_fresh = n_prompts - len(inject)
 
             with nvtx_range("rl/inference-setup", time=True):
-                # Asyncronously run inference and rollout collection
-                rollout_generator = get_rollout_generator(
-                    args, inference_interface, n_fresh, samples_per_group
-                )
+                # The streaming generator persists across iterations, so its request
+                # must retain the trainer batch size. Only this collection's pulls
+                # are reduced by restored groups. A one-shot generator, however,
+                # must produce only the fresh groups because it is drained below.
+                request_num_groups = n_prompts if args.rl_partial_rollouts else n_fresh
+                if request_num_groups == 0:
+                    rollout_generator = _empty_rollout_generator()
+                else:
+                    rollout_generator = get_rollout_generator(
+                        args, inference_interface, request_num_groups, samples_per_group
+                    )
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()

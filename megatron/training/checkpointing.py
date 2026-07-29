@@ -40,7 +40,6 @@ from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.rl.rl_utils import maybe_compact_rollout_bank
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -84,11 +83,18 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 _deletion_processes = []
 
 
+def _maybe_compact_rollout_bank(iteration):
+    """Compact the rollout bank without making checkpointing depend eagerly on RL."""
+    from megatron.rl.rl_utils import maybe_compact_rollout_bank
+
+    maybe_compact_rollout_bank(iteration)
+
+
 def _register_rollout_bank_compaction(async_save_request, iteration):
     """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
 
     def rollout_bank_finalize_fn(iteration=iteration):
-        maybe_compact_rollout_bank(iteration)
+        _maybe_compact_rollout_bank(iteration)
 
     async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
 
@@ -892,10 +898,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
                      f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
-    # Wait so everyone is done (not necessary)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
@@ -910,7 +912,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         # saves; async saves compact in their durability finalize callback above.
         # Rank-0 no-op otherwise.
         if getattr(args, "rl_durable_rollout_bank", False):
-            maybe_compact_rollout_bank(iteration)
+            _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 

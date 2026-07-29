@@ -12,7 +12,8 @@ partial-group snapshots (design phases B/C) are out of scope here.
 Layout (single-writer, rank-0 only, on Lustre)::
 
     <bank_dir>/
-        MANIFEST.json                 # {"trained_through", "segments", "compacted_at"}
+        MANIFEST.json                 # {"format_version", "trained_through",
+                                      #  "segments", "compacted_at"}
         consumed.log                  # append-only markers {"uid", "iter"} on trainer pull
         gen-<iter>/
             ledger.log                # append-only JSONL, one self-describing index
@@ -63,6 +64,9 @@ _TOKEN_DTYPE = np.int32
 _LOGPROB_DTYPE = np.float16
 _MASK_DTYPE = np.uint8
 
+# Bump whenever the manifest/ledger schema or any sidecar dtype/layout changes.
+# Readers intentionally fail closed; cross-version migration must be explicit.
+_FORMAT_VERSION = 1
 _MANIFEST = "MANIFEST.json"
 _LEDGER = "ledger.log"
 _CONSUMED = "consumed.log"
@@ -91,6 +95,7 @@ class LedgerRecord(TypedDict):
     One self-describing JSONL index record for a completed group.
 
     Args:
+        format_version: The persisted schema and sidecar-layout version.
         uid: The unique identifier of the group.
         collection_iter: The iteration number of the collection.
         member_type: The type of the member. This is the type of the rollouts in the group.
@@ -102,6 +107,7 @@ class LedgerRecord(TypedDict):
         checksum: The checksum of the group.
     """
 
+    format_version: int
     uid: str
     collection_iter: int
     member_type: Literal["Rollout", "TokenRollout"]
@@ -118,11 +124,13 @@ class Manifest(TypedDict):
     Bank-level index: how far training got and which segments exist.
 
     Args:
+        format_version: The persisted schema and sidecar-layout version.
         trained_through: The iteration number of the last checkpoint.
         segments: The list of segment names (e.g. ["gen-000000", "gen-000001"]).
         compacted_at: The iteration number of the last compaction.
     """
 
+    format_version: int
     trained_through: int
     segments: list[str]
     compacted_at: int
@@ -158,6 +166,25 @@ def _checksum(record_wo_checksum: dict, *slices: bytes) -> str:
     return h.hexdigest()
 
 
+def _validate_format_version(data: dict, source: str) -> None:
+    """Reject banks that this implementation cannot decode safely."""
+    version = data.get("format_version")
+    if version != _FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported RolloutBank format_version {version!r} in {source}; "
+            f"expected {_FORMAT_VERSION}. Migrate or remove the incompatible rollout bank."
+        )
+
+
+def _fsync_directory(path: str) -> None:
+    """Persist directory-entry changes made beneath ``path``."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class RolloutBank:
     """Single-writer durable store for completed rollout groups (rank-0 only)."""
 
@@ -180,7 +207,14 @@ class RolloutBank:
         self._last_checkpoint_iter = 0
         self._warned_over_cap = False
         if not os.path.exists(self._manifest_path):
-            self._write_manifest_atomic({"trained_through": 0, "segments": [], "compacted_at": 0})
+            self._write_manifest_atomic(
+                {
+                    "format_version": _FORMAT_VERSION,
+                    "trained_through": 0,
+                    "segments": [],
+                    "compacted_at": 0,
+                }
+            )
 
     # ------------------------------------------------------------------ paths
     @property
@@ -194,18 +228,29 @@ class RolloutBank:
     def _read_manifest(self) -> Manifest:
         try:
             with open(self._manifest_path) as f:
-                return json.load(f)
+                manifest = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             logger.warning(f"Manifest file not found at {self._manifest_path}; creating new one.")
-            return {"trained_through": 0, "segments": [], "compacted_at": 0}
+            manifest = {
+                "format_version": _FORMAT_VERSION,
+                "trained_through": 0,
+                "segments": [],
+                "compacted_at": 0,
+            }
+        _validate_format_version(manifest, self._manifest_path)
+        return manifest
 
     def _write_manifest_atomic(self, manifest: Manifest) -> None:
+        manifest = dict(manifest)
+        manifest.setdefault("format_version", _FORMAT_VERSION)
+        _validate_format_version(manifest, self._manifest_path)
         tmp = self._manifest_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(manifest, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._manifest_path)  # atomic flip
+        _fsync_directory(self.bank_dir)
 
     # ------------------------------------------------------------- lifecycle
     def set_collection(self, iteration: int) -> None:
@@ -216,7 +261,11 @@ class RolloutBank:
         self._collection_iter = iteration
         seg = _segment_name(iteration)
         self._seg_dir = os.path.join(self.bank_dir, seg)
+        segment_created = not os.path.exists(self._seg_dir)
         os.makedirs(self._seg_dir, exist_ok=True)
+        if segment_created:
+            _fsync_directory(self.bank_dir)
+        self._truncate_torn_ledger_tail(self._seg_dir)
         self._seq = self._next_sequence(self._seg_dir, seg)
         self._tok_off = self._file_size(_TOKENS_BIN)
         self._lp_off = self._file_size(_LOGPROBS_BIN)
@@ -234,6 +283,34 @@ class RolloutBank:
             if separator and uid_seg == seg and uid_seq.isdigit():
                 next_seq = max(next_seq, int(uid_seq) + 1)
         return next_seq
+
+    def _truncate_torn_ledger_tail(self, seg_dir: str) -> None:
+        """Remove an incomplete final JSONL line before resuming appends."""
+        path = os.path.join(seg_dir, _LEDGER)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return
+
+        with open(path, "rb+") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) == b"\n":
+                return
+
+            end = f.tell()
+            truncate_at = 0
+            while end > 0:
+                start = max(0, end - 8192)
+                f.seek(start)
+                chunk = f.read(end - start)
+                newline = chunk.rfind(b"\n")
+                if newline >= 0:
+                    truncate_at = start + newline + 1
+                    break
+                end = start
+
+            logger.warning("Truncating incomplete final rollout-bank ledger record in %s", path)
+            f.truncate(truncate_at)
+            f.flush()
+            os.fsync(f.fileno())
 
     def _file_size(self, name: str) -> int:
         path = os.path.join(self._seg_dir, name)
@@ -285,19 +362,29 @@ class RolloutBank:
 
     def _write_sidecar(self, handle_attr: str, name: str, data: bytes) -> None:
         f = getattr(self, handle_attr)
+        created = False
         if f is None:
-            f = open(os.path.join(self._seg_dir, name), "ab")
+            path = os.path.join(self._seg_dir, name)
+            created = not os.path.exists(path)
+            f = open(path, "ab")
             setattr(self, handle_attr, f)
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
+        if created:
+            _fsync_directory(self._seg_dir)
 
     def _append_ledger(self, record: LedgerRecord) -> None:
+        created = False
         if self._ledger_f is None:
-            self._ledger_f = open(os.path.join(self._seg_dir, _LEDGER), "a")
+            path = os.path.join(self._seg_dir, _LEDGER)
+            created = not os.path.exists(path)
+            self._ledger_f = open(path, "a")
         self._ledger_f.write(json.dumps(record, separators=(",", ":")) + "\n")
         self._ledger_f.flush()
         os.fsync(self._ledger_f.fileno())
+        if created:
+            _fsync_directory(self._seg_dir)
 
     def _encode(self, group: "RolloutGroup", uid: str) -> EncodedGroup:
         """Build the JSONL index record + packed sidecar bytes for one group.
@@ -316,6 +403,7 @@ class RolloutBank:
 
         if not token_typed:
             record: LedgerRecord = {
+                "format_version": _FORMAT_VERSION,
                 "uid": uid,
                 "collection_iter": self._collection_iter,
                 "member_type": member_type,
@@ -351,6 +439,7 @@ class RolloutBank:
 
         tok_bytes = np.asarray(tok_flat, dtype=_TOKEN_DTYPE).tobytes()
         record: LedgerRecord = {
+            "format_version": _FORMAT_VERSION,
             "uid": uid,
             "collection_iter": self._collection_iter,
             "member_type": member_type,
@@ -399,10 +488,13 @@ class RolloutBank:
         if not uid:
             return
         marker: ConsumedMarker = {"uid": uid, "iter": iteration}
+        created = not os.path.exists(self._consumed_path)
         with open(self._consumed_path, "a") as f:
             f.write(json.dumps(marker, separators=(",", ":")) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        if created:
+            _fsync_directory(self.bank_dir)
 
     def restore(self, trained_through: int) -> list["RolloutGroup"]:
         """Replay the ledger and return groups not yet trained through ``T``."""
@@ -488,10 +580,12 @@ class RolloutBank:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    record = json.loads(line)
                 except json.JSONDecodeError:
                     logger.debug(f"Invalid JSON in {path}: {line}")
                     continue  # torn final record from a mid-append kill
+                _validate_format_version(record, path)
+                yield record
 
     def _decode(self, record: LedgerRecord, seg_dir: str) -> Optional["RolloutGroup"]:
         """
@@ -601,13 +695,20 @@ class RolloutBank:
         if os.path.exists(staging):
             _rmtree(staging)
         os.makedirs(staging, exist_ok=True)
+        _fsync_directory(self.bank_dir)
         self._rewrite_segment(staging, iteration, survivors)
 
         if os.path.exists(new_dir):
             _rmtree(new_dir)
         os.replace(staging, new_dir)
+        _fsync_directory(self.bank_dir)
         self._write_manifest_atomic(
-            {"trained_through": iteration, "segments": [new_seg], "compacted_at": iteration}
+            {
+                "format_version": _FORMAT_VERSION,
+                "trained_through": iteration,
+                "segments": [new_seg],
+                "compacted_at": iteration,
+            }
         )
         for seg in old_segments:
             if seg != new_seg:

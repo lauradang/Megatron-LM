@@ -20,6 +20,7 @@ from megatron.rl import rl_utils, rollout_bank
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.rollout_bank import (
     _CONSUMED,
+    _FORMAT_VERSION,
     _LEDGER,
     _MANIFEST,
     _TOKENS_BIN,
@@ -39,6 +40,32 @@ def test_agent_api_reexports_shared_rollout_types():
     assert SharedRollout is Rollout
     assert SharedRolloutGroup is RolloutGroup
     assert SharedTokenRollout is TokenRollout
+
+
+def test_token_rollout_declares_advantage_override():
+    rollout = TokenRollout(
+        trajectory=[[1]],
+        reward=1.0,
+        policy_epoch=[[(0, 0)]],
+        kv_cache_epoch=[[(0, 0)]],
+        num_evictions=[0],
+        advantage_override="-5.0",
+    )
+
+    assert "advantage_override" in TokenRollout.model_fields
+    assert rollout.advantage_override == -5.0
+
+
+def test_rollout_reward_accepts_none():
+    rollout = Rollout(
+        trajectory=["prompt"],
+        reward=None,
+        policy_epoch=[[(0, 0)]],
+        kv_cache_epoch=[[(0, 0)]],
+        num_evictions=[0],
+    )
+
+    assert rollout.reward is None
 
 
 def make_token_group(members, *, batch_id=0, index_in_batch=0):
@@ -86,6 +113,67 @@ def text_group():
 
 
 class TestRoundTrip:
+    def test_manifest_and_ledger_record_current_format_version(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(3)
+        bank.append(sample_group())
+        bank.close()
+
+        manifest = json.loads((tmp_path / _MANIFEST).read_text())
+        ledger_path = tmp_path / _segment_name(3) / _LEDGER
+        record = json.loads(ledger_path.read_text().splitlines()[0])
+
+        assert manifest["format_version"] == _FORMAT_VERSION
+        assert record["format_version"] == _FORMAT_VERSION
+
+    @pytest.mark.parametrize(
+        "invalid_version",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param(_FORMAT_VERSION + 1, id="unsupported"),
+        ],
+    )
+    def test_restore_rejects_incompatible_manifest_version(self, tmp_path, invalid_version):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(3)
+        bank.append(sample_group())
+        bank.close()
+
+        manifest_path = tmp_path / _MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        if invalid_version is None:
+            manifest.pop("format_version")
+        else:
+            manifest["format_version"] = invalid_version
+        manifest_path.write_text(json.dumps(manifest))
+
+        with pytest.raises(ValueError, match="Unsupported RolloutBank format_version"):
+            RolloutBank(str(tmp_path)).restore(0)
+
+    @pytest.mark.parametrize(
+        "invalid_version",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param(_FORMAT_VERSION + 1, id="unsupported"),
+        ],
+    )
+    def test_restore_rejects_incompatible_ledger_version(self, tmp_path, invalid_version):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(3)
+        bank.append(sample_group())
+        bank.close()
+
+        ledger_path = tmp_path / _segment_name(3) / _LEDGER
+        record = json.loads(ledger_path.read_text())
+        if invalid_version is None:
+            record.pop("format_version")
+        else:
+            record["format_version"] = invalid_version
+        ledger_path.write_text(json.dumps(record) + "\n")
+
+        with pytest.raises(ValueError, match="Unsupported RolloutBank format_version"):
+            RolloutBank(str(tmp_path)).restore(0)
+
     def test_encode_returns_named_payload(self, tmp_path):
         assert hasattr(rollout_bank, "EncodedGroup")
 
@@ -155,7 +243,124 @@ class TestRoundTrip:
 
 
 class TestDurability:
-    def test_torn_final_ledger_line_dropped(self, tmp_path):
+    def test_manifest_replace_is_followed_by_bank_directory_fsync(
+        self, tmp_path, monkeypatch
+    ):
+        bank = RolloutBank(str(tmp_path))
+        events = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            real_replace(src, dst)
+            events.append("replace")
+
+        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(
+            rollout_bank,
+            "_fsync_directory",
+            lambda path: events.append(f"dir:{path}"),
+        )
+
+        bank._write_manifest_atomic(
+            {"trained_through": 1, "segments": [], "compacted_at": 0}
+        )
+
+        assert events == ["replace", f"dir:{tmp_path}"]
+
+    def test_first_append_fsyncs_new_entries_after_file_contents(
+        self, tmp_path, monkeypatch
+    ):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        segment = tmp_path / _segment_name(0)
+        events = []
+        monkeypatch.setattr(os, "fsync", lambda fd: events.append("file"))
+        monkeypatch.setattr(
+            rollout_bank,
+            "_fsync_directory",
+            lambda path: events.append(f"dir:{path}"),
+        )
+
+        bank.append(sample_group())
+
+        assert events == ["file", f"dir:{segment}"] * 4
+
+        events.clear()
+        bank.append(sample_group())
+        assert events == ["file"] * 4
+
+    def test_new_segment_is_durable_before_manifest_publication(
+        self, tmp_path, monkeypatch
+    ):
+        bank = RolloutBank(str(tmp_path))
+        events = []
+        monkeypatch.setattr(
+            rollout_bank,
+            "_fsync_directory",
+            lambda path: events.append(f"dir:{path}"),
+        )
+        monkeypatch.setattr(
+            bank,
+            "_write_manifest_atomic",
+            lambda manifest: events.append(f"manifest:{manifest['segments'][-1]}"),
+        )
+
+        bank.set_collection(7)
+
+        assert events == [f"dir:{tmp_path}", f"manifest:{_segment_name(7)}"]
+
+    def test_compacted_segment_is_durable_before_manifest_publication(
+        self, tmp_path, monkeypatch
+    ):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(1)
+        events = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            real_replace(src, dst)
+            if str(src).endswith(".compact"):
+                events.append("segment_replace")
+
+        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(
+            rollout_bank,
+            "_fsync_directory",
+            lambda path: events.append(f"dir:{path}"),
+        )
+        monkeypatch.setattr(bank, "restore", lambda iteration: [])
+        monkeypatch.setattr(bank, "_rewrite_segment", lambda *args: None)
+        monkeypatch.setattr(
+            bank,
+            "_write_manifest_atomic",
+            lambda manifest: events.append(f"manifest:{manifest['trained_through']}"),
+        )
+
+        bank.checkpoint(2)
+
+        replace_index = events.index("segment_replace")
+        assert events[replace_index : replace_index + 3] == [
+            "segment_replace",
+            f"dir:{tmp_path}",
+            "manifest:2",
+        ]
+
+    def test_first_consumed_marker_fsyncs_bank_directory(self, tmp_path, monkeypatch):
+        bank = RolloutBank(str(tmp_path))
+        events = []
+        monkeypatch.setattr(os, "fsync", lambda fd: events.append("file"))
+        monkeypatch.setattr(
+            rollout_bank,
+            "_fsync_directory",
+            lambda path: events.append(f"dir:{path}"),
+        )
+
+        bank.mark_consumed("gen-000000/0", 1)
+        bank.mark_consumed("gen-000000/1", 1)
+
+        assert events == ["file", f"dir:{tmp_path}", "file"]
+
+    def test_torn_final_ledger_line_dropped_and_append_recovers_after_restart(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(0)
         bank.append(sample_group())
@@ -169,6 +374,16 @@ class TestDurability:
 
         restored = RolloutBank(str(tmp_path)).restore(0)
         assert len(restored) == 2  # the two intact records survive
+
+        restarted = RolloutBank(str(tmp_path))
+        restarted.set_collection(0)
+        new_uid = restarted.append(sample_group())
+        restarted.close()
+
+        restored = RolloutBank(str(tmp_path)).restore(0)
+        assert len(restored) == 3
+        assert new_uid == f"{_segment_name(0)}/2"
+        assert new_uid in {group.uid for group in restored}
 
     def test_truncated_sidecar_slice_dropped(self, tmp_path):
         bank = RolloutBank(str(tmp_path))

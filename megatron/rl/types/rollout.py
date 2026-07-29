@@ -12,7 +12,7 @@ class Rollout(AgentBaseModel):
 
     trajectory: list[str]
     prompt_length: list[int] | None = None
-    reward: float = None
+    reward: float | None = None
     env_id: str = ''
     problem_id: str | None = None
     policy_epoch: list[list[tuple[int, int]]]
@@ -32,6 +32,9 @@ class TokenRollout(AgentBaseModel):
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
+    # When set, replaces this rollout's group-normalized advantage with a fixed
+    # value after group normalization in calculate_grpo_advantages.
+    advantage_override: float | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]
