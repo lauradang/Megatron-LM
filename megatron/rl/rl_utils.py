@@ -815,8 +815,6 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             if exit_layer is not None
             else samples_per_group
         )
-        # Attach the durable bank so stage_assemble writes each completed group
-        # through to disk (no-op when the bank is disabled / non-rank-0).
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             streaming=streaming,
