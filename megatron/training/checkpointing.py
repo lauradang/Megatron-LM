@@ -40,6 +40,7 @@ from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.rl.rl_utils import maybe_compact_rollout_bank
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -81,6 +82,16 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
+
+
+def _register_rollout_bank_compaction(async_save_request, iteration):
+    """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
+
+    def rollout_bank_finalize_fn(iteration=iteration):
+        maybe_compact_rollout_bank(iteration)
+
+    async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
+
 
 def finalize_deletion_processes(blocking=False):
     """Clean up deletion processes to prevent zombie processes.
@@ -868,6 +879,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             wandb_finalize_fn()
 
+    if (
+        args.async_save
+        and getattr(args, "rl_durable_rollout_bank", False)
+        and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+    ):
+        assert async_save_request is not None
+        _register_rollout_bank_compaction(async_save_request, iteration)
+
     if args.async_save:
         schedule_async_save(async_save_request)
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
@@ -888,12 +907,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
         # Durable rollout bank: compact at the checkpoint boundary so the bank's
         # compacted-through T tracks this (now durable) checkpoint. Only on sync
-        # saves — for async_save the checkpoint is not yet finalized here, so we
-        # leave compaction to a later sync save / restart to avoid pruning groups
-        # whose training is not yet durably persisted. Rank-0 no-op otherwise.
+        # saves; async saves compact in their durability finalize callback above.
+        # Rank-0 no-op otherwise.
         if getattr(args, "rl_durable_rollout_bank", False):
-            from megatron.rl.rl_utils import maybe_compact_rollout_bank
-
             maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)

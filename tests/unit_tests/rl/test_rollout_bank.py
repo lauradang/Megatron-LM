@@ -15,7 +15,8 @@ import os
 import numpy as np
 import pytest
 
-from megatron.rl import rollout_bank
+from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
+from megatron.rl import rl_utils, rollout_bank
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.rollout_bank import (
     _CONSUMED,
@@ -28,6 +29,7 @@ from megatron.rl.rollout_bank import (
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
 from megatron.rl.types import TokenRollout as SharedTokenRollout
+from megatron.training.checkpointing import _register_rollout_bank_compaction
 
 # Reuse the pipeline mocks so the integration test drives the real pipeline.
 from tests.unit_tests.rl.test_grouped_rollouts import MockGenerator, MockInferenceInterface
@@ -219,6 +221,33 @@ class TestMarkerFilter:
 
 
 class TestCompaction:
+    def test_async_compaction_finalize_runs_with_captured_iteration(self, tmp_path, monkeypatch):
+        bank = RolloutBank(str(tmp_path))
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", bank)
+        bank.set_collection(1)
+        first = bank.append(sample_group())
+        bank.mark_consumed(first, 1)
+
+        first_save = AsyncRequest(None, (), [])
+        second_save = AsyncRequest(None, (), [])
+        _register_rollout_bank_compaction(first_save, 1)
+        _register_rollout_bank_compaction(second_save, 2)
+
+        bank.set_collection(2)
+        second = bank.append(sample_group())
+        bank.mark_consumed(second, 2)
+
+        first_save.finalize_fns[0]()
+        manifest = json.loads((tmp_path / _MANIFEST).read_text())
+        assert manifest["trained_through"] == 1
+        assert {group.uid for group in bank.restore(1)} == {second}
+
+        second_save.finalize_fns[0]()
+        manifest = json.loads((tmp_path / _MANIFEST).read_text())
+        assert manifest["trained_through"] == 2
+        assert manifest["segments"] == [_segment_name(2)]
+        assert bank.restore(2) == []
+
     def test_marker_after_compaction_is_not_orphaned(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(0)
