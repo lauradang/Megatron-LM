@@ -2348,6 +2348,12 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
             f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+            f"{env_id}_pipeline_refilled_placeholder_groups": (
+                pipeline.refilled_placeholder_groups
+            ),
+            f"{env_id}_pipeline_refilled_placeholder_batches": (
+                pipeline.refilled_placeholder_batches
+            ),
         })
         for name, samples in (
             ("infer_queue_dwell", pipeline.infer_queue_dwell),
@@ -2370,6 +2376,8 @@ def _collect_rollout_pipeline_metrics() -> dict:
         pipeline.inferred_count = 0
         pipeline.assembled_count = 0
         pipeline.yielded_count = 0
+        pipeline.refilled_placeholder_groups = 0
+        pipeline.refilled_placeholder_batches = 0
         gate.prepare_blocked_seconds = 0.0
         gate.acquire_calls = 0
         gate.release_calls = 0
