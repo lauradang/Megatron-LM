@@ -763,8 +763,8 @@ def maybe_get_rollout_bank(args):
         logger.debug("Durable rollout bank is disabled; proceeding without it.")
         return None
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-        logger.warning(
-            "Durable rollout bank cannot be activated on non-zero ranks; proceeding without it."
+        logger.debug(
+            "Durable rollout bank runs on rank 0 only; skipping on this rank."
         )
         return None
     if _ROLLOUT_BANK is None:
