@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+import logging
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,8 @@ from .api import (
     TokenRollout,
 )
 from .pass_at_evaluation_agent import PassAtEvaluationAgent
+
+logger = logging.getLogger(__name__)
 
 
 class RewardOnlyEvaluationResponse(EvaluationResponse[RewardEvaluationResult]):
@@ -293,21 +296,55 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
-        # Phase B resume: if this re-served row has a saved partial snapshot (matched
-        # by problem_id), attach its finished members so stage_prepare regenerates
-        # only the missing ones. get_prompt re-derives the same golden for the same
-        # row, so rewards for both finished and regenerated members stay consistent.
-        resume_members = None
-        partial_uid = None
-        problem_id = golden.get("problem_id") if isinstance(golden, dict) else None
+        resume_members: dict[int, InferenceResponse] | None = None
+        partial_uid: str | None = None
+        problem_id: str | None = golden.get("problem_id") if isinstance(golden, dict) else None
         if self._resume_partials and problem_id is not None:
-            snap = self._resume_partials.pop(problem_id, None)
+            snapshots = self._resume_partials.get(problem_id)
+            snap = snapshots.pop(0) if snapshots else None
+            if snapshots == []:
+                del self._resume_partials[problem_id]
             if snap is not None:
-                partial_uid = snap["partial_uid"]
-                resume_members = [
-                    (m["rollout_idx"], InferenceResponse.model_validate(m["response"]))
-                    for m in snap["finished_members"]
-                ]
+                # Carry the occurrence identity even when members are incompatible
+                # and must be regenerated, so completing the regenerated group
+                # invalidates a stale on-disk copy of this snapshot.
+                partial_uid = snap.get("partial_uid")
+                members = snap.get("finished_members")
+                indices = (
+                    [member.get("rollout_idx") for member in members]
+                    if isinstance(members, list)
+                    else []
+                )
+                valid = (
+                    snap.get("rollouts_per_group") == request.rollouts_per_group
+                    and 0 < len(indices) < request.rollouts_per_group
+                    and all(
+                        isinstance(idx, int)
+                        and not isinstance(idx, bool)
+                        and 0 <= idx < request.rollouts_per_group
+                        for idx in indices
+                    )
+                    and len(set(indices)) == len(indices)
+                )
+                if valid:
+                    try:
+                        resume_members: dict[int, InferenceResponse] = {
+                            member["rollout_idx"]: InferenceResponse.model_validate(member["response"])
+                            for member in members
+                        }
+                        partial_uid = snap["partial_uid"]
+                    except (KeyError, TypeError, ValueError):
+                        valid = False
+                        resume_members = None
+                if not valid:
+                    logger.warning(
+                        "Discarding incompatible partial snapshot for %s: "
+                        "saved rollouts_per_group=%r, current=%d, member indices=%r",
+                        problem_id,
+                        snap.get("rollouts_per_group"),
+                        request.rollouts_per_group,
+                        indices,
+                    )
 
         return GroupRolloutParams(
             inference_request=inference_request,

@@ -832,9 +832,10 @@ def get_rollout_generator(
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = _get_or_create_rollout_agent(args, parallel_generation_tasks)
         restored_partials = get_rl_runtime_state().restored_partials
-        for sub_agent in (agent.agents if isinstance(agent, WeightedMultiTask) else [agent]):
+        sub_agents = agent.agents if isinstance(agent, WeightedMultiTask) else [agent]
+        for agent_index, sub_agent in enumerate(sub_agents):
             env_id = getattr(sub_agent, "env_id", "") or "rollout"
-            sub_agent._resume_partials = restored_partials.get(env_id, {})
+            sub_agent._resume_partials = restored_partials.get((env_id, agent_index), {})
         # When speculative rollout is enabled, inflate rollouts_per_group so the
         # draft engine generates oversample_factor * samples_per_group candidates.
         # A thin async wrapper then down-selects to the original samples_per_group
@@ -2449,11 +2450,29 @@ def prep_wandb_metrics(
     return metrics
 
 
-def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> dict[str, dict[str, dict]]:
-    """Group restored PartialGroupSnapshots into env_id -> {problem_id: snap}."""
-    by_env: dict = {}
+def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> RestoredPartials:
+    """
+    Index snapshots without collapsing repeated rows or shared-env agents.
+
+    Args:
+        partials: A list of PartialGroupSnapshot objects.
+
+    Returns:
+        A dictionary of RestoredPartials.
+
+    Example:
+        partials = [
+            PartialGroupSnapshot(env_id="env1", problem_id="problem1", partial_uid="123", agent_index=0, ...),
+            PartialGroupSnapshot(env_id="env1", problem_id="problem2", partial_uid="456", agent_index=0, ...),
+            PartialGroupSnapshot(env_id="env2", problem_id="problem1", partial_uid="789", agent_index=1, ...),
+        ]
+        return {("env1", 0): {"problem1": [PartialGroupSnapshot(partial_uid="123", agent_index=0, ...)], "problem2": [PartialGroupSnapshot(partial_uid="456", agent_index=0, ...)]}, ("env2", 1): {"problem1": [PartialGroupSnapshot(partial_uid="789", agent_index=1, ...)]}}
+    """
+    by_env: RestoredPartials = {}
     for p in partials:
-        by_env.setdefault(p["env_id"], {})[p["problem_id"]] = p
+        agent_key = (p["env_id"], p.get("agent_index", 0))
+        by_problem = by_env.setdefault(agent_key, {})
+        by_problem.setdefault(p["problem_id"], []).append(p)
     return by_env
 
 
@@ -2471,7 +2490,7 @@ def _snapshot_partial_groups(bank: RolloutBank, collection_iter: int) -> None:
         _ROLLOUT_AGENT.agents if isinstance(_ROLLOUT_AGENT, WeightedMultiTask) else [_ROLLOUT_AGENT]
     )
     partials = []
-    for sub_agent in sub_agents:
+    for agent_index, sub_agent in enumerate(sub_agents):
         pipeline = getattr(sub_agent, "_active_pipeline", None)
         if pipeline is None:
             continue
@@ -2495,8 +2514,9 @@ def _snapshot_partial_groups(bank: RolloutBank, collection_iter: int) -> None:
                 continue
             partials.append(
                 {
-                    "partial_uid": f"{env_id}:{problem_id}",
+                    "partial_uid": params.partial_uid,
                     "env_id": env_id,
+                    "agent_index": agent_index,
                     "problem_id": problem_id,
                     "inference_request": req_dump,
                     "golden": golden,

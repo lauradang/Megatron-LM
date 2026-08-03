@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeAlias, TypeVar
 
@@ -67,14 +68,14 @@ class GroupRolloutParams(NamedTuple):
         inference_request: The inference request to use for the rollout.
         build_rollout: A callable that builds a rollout from an inference response.
         golden: The golden response to use for the rollout.
-        resume_members: A list of tuples of (rollout_idx, inference_response) to resume from a partial snapshot.
+        resume_members: Inference responses keyed by rollout index to resume from a partial snapshot.
         partial_uid: The partial uid to use for the rollout.
     """
 
     inference_request: InferenceRequest
     build_rollout: Callable[[InferenceResponse], Awaitable[Rollout]]
     golden: Any = None
-    resume_members: list[tuple[int, InferenceResponse]] | None = None
+    resume_members: dict[int, InferenceResponse] | None = None
     partial_uid: str | None = None
 
 
@@ -331,7 +332,12 @@ class _RolloutPipeline:
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
                     params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
-                    resume: dict[int, InferenceResponse] = {idx: resp for idx, resp in (params.resume_members or [])}
+                    # Assign the durable occurrence identity before any member can
+                    # enter _assemble_pending. Snapshotting and eventual ledger
+                    # append must observe the same value.
+                    if self.bank is not None and params.partial_uid is None:
+                        params = params._replace(partial_uid=uuid.uuid4().hex)
+                    resume: dict[int, InferenceResponse] = params.resume_members or {}
 
                     # This group's rollouts now enter flight (generation starting).
                     # They leave it when consumed into a training batch (rollout
@@ -452,8 +458,8 @@ class _RolloutPipeline:
                         index_in_batch=first.item.index_in_batch,
                     )
                     if self.bank is not None:
-                        # Record the partial_uid when this group was completed from a
-                        # restored partial snapshot, so restore drops the stale entry.
+                        # Record the same occurrence identity used by any live
+                        # snapshot, including snapshots of previously-fresh groups.
                         group.uid = self.bank.append(
                             group, partial_uid=getattr(first.item.params, "partial_uid", None)
                         )

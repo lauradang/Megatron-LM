@@ -18,7 +18,15 @@ import pytest
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.rl import rl_utils, rollout_bank
-from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
+from megatron.rl.agent.api import (
+    GroupedRolloutRequest,
+    Rollout,
+    RolloutGroup,
+    TokenRollout,
+    _InferredItem,
+    _RolloutPipeline,
+)
+from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference.api import InferenceResponse, LLMChatMessage
 from megatron.rl.rollout_bank import (
@@ -676,7 +684,9 @@ class TestRestoreBalancing:
 # ------------------------------------------------------ Phase B: partial groups
 
 
-def make_partial_snapshot(problem_id="p", env_id="test", n=2, finished=1, token=False):
+def make_partial_snapshot(
+    problem_id="p", env_id="test", n=2, finished=1, token=False, *, uid=None, agent_index=0
+):
     """Build a PartialGroupSnapshot dict for the storage-layer tests."""
     if token:
         resp = {
@@ -699,8 +709,9 @@ def make_partial_snapshot(problem_id="p", env_id="test", n=2, finished=1, token=
             "num_evictions": 0,
         }
     return {
-        "partial_uid": f"{env_id}:{problem_id}",
+        "partial_uid": uid or f"{env_id}:{problem_id}",
         "env_id": env_id,
+        "agent_index": agent_index,
         "problem_id": problem_id,
         "inference_request": {"prompt": [{"role": "user", "content": "hi"}], "tools": None},
         "golden": {"problem_id": problem_id, "answer": 1},
@@ -709,6 +720,27 @@ def make_partial_snapshot(problem_id="p", env_id="test", n=2, finished=1, token=
         "index_in_batch": 0,
         "finished_members": [{"rollout_idx": i, "response": resp} for i in range(finished)],
     }
+
+
+class RepeatingProblemAgent(RewardOnlyAgent):
+    """Minimal reward agent that intentionally serves the same dataset row."""
+
+    env_id: str | None = "test"
+
+    async def get_prompt(self, validation):
+        return "t0", {"problem_id": "p", "answer": 0}
+
+    async def get_reward(self, response, golden, finish_reason):
+        return float(response == "t0")
+
+
+class CountingMockInferenceInterface(MockInferenceInterface):
+    def __init__(self):
+        self.calls = 0
+
+    async def base_generate(self, request):
+        self.calls += 1
+        return await super().base_generate(request)
 
 
 class TestPartialSnapshot:
@@ -802,6 +834,124 @@ class TestPartialSnapshot:
         bank.checkpoint(0)
         assert "test:p" in RolloutBank(str(tmp_path))._completed_partial_uids()
 
+    def test_repeated_rows_and_shared_env_agents_keep_distinct_occurrences(self):
+        async def run():
+            indexed = rl_utils._index_partials_by_env(
+                [
+                    make_partial_snapshot("p", uid="occurrence-a", agent_index=0),
+                    make_partial_snapshot("p", uid="occurrence-b", agent_index=0),
+                    make_partial_snapshot("p", uid="occurrence-c", agent_index=1),
+                ]
+            )
+            request = GroupedRolloutRequest(
+                num_groups=1,
+                rollouts_per_group=2,
+                inference_interface=MockInferenceInterface(),
+            )
+            first_agent = RepeatingProblemAgent()
+            second_agent = RepeatingProblemAgent()
+            first_agent._resume_partials = indexed[("test", 0)]
+            second_agent._resume_partials = indexed[("test", 1)]
+            first = await first_agent.prepare_group_rollout(request)
+            second = await first_agent.prepare_group_rollout(request)
+            other = await second_agent.prepare_group_rollout(request)
+            return first, second, other
+
+        first, second, other = asyncio.run(run())
+        assert [first.partial_uid, second.partial_uid, other.partial_uid] == [
+            "occurrence-a",
+            "occurrence-b",
+            "occurrence-c",
+        ]
+
+    def test_fresh_partial_completion_dedups_stale_snapshot(self, tmp_path, monkeypatch):
+        async def run():
+            bank = RolloutBank(str(tmp_path))
+            bank.set_collection(0)
+            agent = RepeatingProblemAgent(parallel_generation_tasks=8)
+            request = GroupedRolloutRequest(
+                num_groups=1,
+                rollouts_per_group=2,
+                inference_interface=MockInferenceInterface(),
+                submission_granularity="B",
+                consumption_granularity="B",
+            )
+            pipeline = _RolloutPipeline(agent, request, 8, bank)
+            await pipeline.stage_prepare()
+            first = await pipeline.infer_queue.get()
+            second = await pipeline.infer_queue.get()
+            response = InferenceResponse(
+                response=LLMChatMessage(role="assistant", content="t0"),
+                raw_text="t0",
+                finish_reason="stop",
+                policy_epoch=[(0, 0)],
+                kv_cache_epoch=[(0, 0)],
+                num_evictions=0,
+            )
+            pipeline._assemble_pending[0] = [_InferredItem(first, response)]
+            agent._active_pipeline = pipeline
+            monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", agent)
+            rl_utils._snapshot_partial_groups(bank, 0)
+            assert bank.restore_partial(0)[0]["partial_uid"] == first.params.partial_uid
+
+            await pipeline.assemble_queue.put(_InferredItem(second, response))
+            pipeline.assemble_queue.shutdown()
+            await pipeline.stage_assemble()
+            bank.close()
+            return first.params.partial_uid
+
+        partial_uid = asyncio.run(run())
+        reopened = RolloutBank(str(tmp_path))
+        assert partial_uid in reopened._completed_partial_uids()
+        assert reopened.restore_partial(0) == []
+
+    def test_full_restored_group_is_discarded_and_regenerated(self):
+        async def run():
+            inference = CountingMockInferenceInterface()
+            agent = RepeatingProblemAgent(parallel_generation_tasks=4)
+            agent._resume_partials = {
+                "p": [make_partial_snapshot("p", n=2, finished=2, uid="complete")]
+            }
+            request = GroupedRolloutRequest(
+                num_groups=1,
+                rollouts_per_group=2,
+                inference_interface=inference,
+                submission_granularity="B",
+                consumption_granularity="B",
+            )
+
+            async def collect():
+                return [group async for group in agent.get_grouped_rollouts(request)]
+
+            return await asyncio.wait_for(collect(), timeout=2), inference.calls
+
+        groups, inference_calls = asyncio.run(run())
+        assert len(groups) == 1 and len(groups[0]) == 2
+        assert inference_calls == 2
+
+    @pytest.mark.parametrize(
+        "indices,saved_n",
+        [([0], 3), ([2], 2), ([0, 0], 2)],
+        ids=["group-size", "member-range", "duplicate-member"],
+    )
+    def test_incompatible_restored_members_are_discarded(self, indices, saved_n):
+        async def run():
+            snapshot = make_partial_snapshot("p", n=saved_n, finished=1)
+            member = snapshot["finished_members"][0]
+            snapshot["finished_members"] = [dict(member, rollout_idx=idx) for idx in indices]
+            agent = RepeatingProblemAgent()
+            agent._resume_partials = {"p": [snapshot]}
+            request = GroupedRolloutRequest(
+                num_groups=1,
+                rollouts_per_group=2,
+                inference_interface=MockInferenceInterface(),
+            )
+            return await agent.prepare_group_rollout(request)
+
+        params = asyncio.run(run())
+        assert params.resume_members is None
+        assert params.partial_uid == "test:p"
+
 
 class ResumingMockGenerator(MockGenerator):
     """MockGenerator whose first group resumes from one saved member."""
@@ -818,7 +968,7 @@ class ResumingMockGenerator(MockGenerator):
     async def prepare_group_rollout(self, request):
         params = await super().prepare_group_rollout(request)
         if self.prepare_group_rollout_calls == 1:  # first group resumes
-            return params._replace(resume_members=[(0, self._saved)], partial_uid="test:0")
+            return params._replace(resume_members={0: self._saved}, partial_uid="test:0")
         return params
 
 

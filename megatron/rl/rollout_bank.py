@@ -117,9 +117,9 @@ class LedgerRecord(TypedDict):
     tok: NotRequired[SidecarMeta]
     lp: NotRequired[SidecarMeta]
     mask: NotRequired[SidecarMeta]
-    # Set only on a group completed from a restored partial snapshot (Phase B).
-    # restore_partial() drops any snapshot partial whose partial_uid appears on a
-    # completed ledger record, giving exactly-once across a complete-then-crash.
+    # Set on every bank-backed live group. restore_partial() drops any snapshot
+    # partial whose partial_uid appears on a completed ledger record, giving
+    # exactly-once across a complete-then-crash.
     partial_uid: NotRequired[str]
     checksum: NotRequired[str]
 
@@ -143,9 +143,11 @@ class PartialGroupSnapshot(TypedDict):
     """A partial group's finished members plus what is needed to complete it.
 
     Args:
-        partial_uid: Stable ``f"{env_id}:{problem_id}"`` identity used for exactly-once
+        partial_uid: Unique per-group occurrence identity used for exactly-once
             dedup against completed ledger records.
         env_id: The environment/sub-agent the group belongs to.
+        agent_index: Stable position of the sub-agent in the configured agent list.
+            This disambiguates agents that intentionally share an env_id.
         problem_id: The dataset-row identity used to re-attach on resume.
         inference_request: ``InferenceRequest.model_dump()`` (the prompt).
         golden: The dataset reward answer (JSON-serializable).
@@ -157,6 +159,7 @@ class PartialGroupSnapshot(TypedDict):
 
     partial_uid: str
     env_id: str
+    agent_index: int
     problem_id: str
     inference_request: dict
     golden: dict
@@ -166,9 +169,9 @@ class PartialGroupSnapshot(TypedDict):
     finished_members: list[PartialMember]
 
 
-#: Maps ``env_id -> {problem_id -> PartialGroupSnapshot}``. Built once at resume by
-#: ``_index_partials_by_env`` so each sub-agent can pop its own partials by problem_id.
-RestoredPartials: TypeAlias = dict[str, dict[str, PartialGroupSnapshot]]
+#: Maps ``(env_id, agent_index) -> {problem_id -> [PartialGroupSnapshot, ...]}``.
+#: Per-problem lists preserve repeated dataset-row occurrences in snapshot order.
+RestoredPartials: TypeAlias = dict[tuple[str, int], dict[str, list[PartialGroupSnapshot]]]
 
 
 class Manifest(TypedDict):
@@ -388,9 +391,9 @@ class RolloutBank:
         """Write-through one completed group; return its stable uid.
 
         A uid is assigned for a new group or preserved when rewriting an
-        existing group during compaction. ``partial_uid`` is recorded when the group
-        was completed from a restored partial snapshot (Phase B), so restore can drop
-        the now-stale snapshot entry (exactly-once).
+        existing group during compaction. ``partial_uid`` is the live group's durable
+        occurrence identity, so restore can drop a now-stale snapshot entry
+        (exactly-once).
         """
         assert self._seg_dir is not None, "set_collection() must be called before append()"
         current_seg = _segment_name(self._collection_iter)
@@ -618,11 +621,15 @@ class RolloutBank:
         Args:
             trained_through: The resumed checkpoint step (accepted for symmetry with
                 ``restore``; the ledger dedup is what makes resume correct here).
+
+        Returns:
+            A list of PartialGroupSnapshot objects.
         """
         payload = self._read_inflight()
         if payload is None:
             return []
         completed = self._completed_partial_uids()
+        # only return partials that were not part of a completed group so that we don't resume the same partial twice
         return [p for p in payload["partials"] if p["partial_uid"] not in completed]
 
     def _read_inflight(self) -> Optional[dict]:
@@ -650,6 +657,7 @@ class RolloutBank:
             seg_dir = os.path.join(self.bank_dir, seg)
             for record in self._read_ledger(seg_dir):
                 pid = record.get("partial_uid")
+                # if partial uid found in ledger, then it was part of a completed group
                 if pid:
                     seen.add(pid)
         return seen
