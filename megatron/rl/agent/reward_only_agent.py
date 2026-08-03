@@ -5,6 +5,7 @@ import functools
 from typing import Any
 
 import numpy as np
+from pydantic import PrivateAttr
 from tqdm.asyncio import tqdm
 
 from ..inference import (
@@ -48,6 +49,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
     env_id: str | None = None
     max_turns: int = 1
+    _resume_partials: dict | None = PrivateAttr(default=None)
 
     def get_dataset(self, validation: bool = False):
         """Return validation or train dataset."""
@@ -297,10 +299,9 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         # row, so rewards for both finished and regenerated members stay consistent.
         resume_members = None
         partial_uid = None
-        resume_map = getattr(self, "_resume_partials", None)
         problem_id = golden.get("problem_id") if isinstance(golden, dict) else None
-        if resume_map and problem_id is not None:
-            snap = resume_map.pop(problem_id, None)  # pop: match each saved partial once
+        if self._resume_partials and problem_id is not None:
+            snap = self._resume_partials.pop(problem_id, None)
             if snap is not None:
                 partial_uid = snap["partial_uid"]
                 resume_members = [

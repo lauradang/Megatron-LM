@@ -62,15 +62,18 @@ class GroupRolloutParams(NamedTuple):
     """Returned by agent.prepare_group_rollout.
 
     One instance is created per group call and reused for all rollouts in that group.
+
+    Args:
+        inference_request: The inference request to use for the rollout.
+        build_rollout: A callable that builds a rollout from an inference response.
+        golden: The golden response to use for the rollout.
+        resume_members: A list of tuples of (rollout_idx, inference_response) to resume from a partial snapshot.
+        partial_uid: The partial uid to use for the rollout.
     """
 
     inference_request: InferenceRequest
     build_rollout: Callable[[InferenceResponse], Awaitable[Rollout]]
-    # Phase B (partial-group resume). golden is surfaced explicitly so the
-    # once-per-window snapshot never introspects the build_rollout closure.
     golden: Any = None
-    # Set when this group is being completed from a restored partial snapshot:
-    # the already-finished members (by rollout_idx) and the stable dedup id.
     resume_members: list[tuple[int, InferenceResponse]] | None = None
     partial_uid: str | None = None
 
@@ -328,10 +331,7 @@ class _RolloutPipeline:
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
                     params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
-
-                    # Phase B resume: members finished before a kill are restored here
-                    # so only the missing indices regenerate.
-                    resume = {idx: resp for idx, resp in (params.resume_members or [])}
+                    resume: dict[int, InferenceResponse] = {idx: resp for idx, resp in (params.resume_members or [])}
 
                     # This group's rollouts now enter flight (generation starting).
                     # They leave it when consumed into a training batch (rollout
@@ -340,11 +340,6 @@ class _RolloutPipeline:
                     add_inflight(self.request.rollouts_per_group)
 
                     if resume:
-                        # Seed the assembly bucket with the restored finished members;
-                        # the bucket then fills to N and stage_assemble builds + banks it
-                        # unchanged. No gate "R" slot is taken for a seeded member (none
-                        # is released for it either, since it never reaches _infer_one).
-                        # This loop has no await, so it is atomic w.r.t. stage_assemble.
                         bucket = self._assemble_pending.setdefault(group_id, [])
                         for saved_idx, saved_response in resume.items():
                             seed = _InferWorkItem(

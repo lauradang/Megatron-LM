@@ -48,7 +48,7 @@ import hashlib
 import json
 import logging
 import os
-from typing import Iterator, Literal, NamedTuple, NotRequired, Optional, TypedDict
+from typing import Iterator, Literal, NamedTuple, NotRequired, Optional, TypeAlias, TypedDict
 
 import numpy as np
 
@@ -164,6 +164,11 @@ class PartialGroupSnapshot(TypedDict):
     batch_id: int
     index_in_batch: int
     finished_members: list[PartialMember]
+
+
+#: Maps ``env_id -> {problem_id -> PartialGroupSnapshot}``. Built once at resume by
+#: ``_index_partials_by_env`` so each sub-agent can pop its own partials by problem_id.
+RestoredPartials: TypeAlias = dict[str, dict[str, PartialGroupSnapshot]]
 
 
 class Manifest(TypedDict):
@@ -573,7 +578,6 @@ class RolloutBank:
                     restored.append(group)
         return restored
 
-    # ------------------------------------------------ partial snapshot (Phase B)
     def snapshot_partial(
         self, partials: list["PartialGroupSnapshot"], collection_iter: int
     ) -> None:

@@ -100,6 +100,7 @@ from megatron.rl.sequence_packing_utils import (
     update_microbatch_calculator,
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
+from megatron.rl.rollout_bank import PartialGroupSnapshot, RestoredPartials, RolloutBank
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
@@ -350,8 +351,7 @@ class RLRuntimeState:
         self.latest_batch_num_sequences = 0
         self.rollout_bank = None
         self.restored_groups: GroupQueuesPerEnv = {}
-        # Phase B: env_id -> {problem_id: PartialGroupSnapshot}, loaded once at resume.
-        self.restored_partials = {}
+        self.restored_partials: RestoredPartials = {}
         self.bank_restored = False
         self.fresh_overflow: GroupQueuesPerEnv = {}
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
@@ -831,9 +831,6 @@ def get_rollout_generator(
         reset_inflight()
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = _get_or_create_rollout_agent(args, parallel_generation_tasks)
-        # Phase B: hand each sub-agent its restored partial-group snapshots, keyed by
-        # problem_id within the sub-agent's env. Runs once, when the streaming
-        # generator is created — exactly when resume applies.
         restored_partials = get_rl_runtime_state().restored_partials
         for sub_agent in (agent.agents if isinstance(agent, WeightedMultiTask) else [agent]):
             env_id = getattr(sub_agent, "env_id", "") or "rollout"
@@ -2452,7 +2449,7 @@ def prep_wandb_metrics(
     return metrics
 
 
-def _index_partials_by_env(partials):
+def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> dict[str, dict[str, dict]]:
     """Group restored PartialGroupSnapshots into env_id -> {problem_id: snap}."""
     by_env: dict = {}
     for p in partials:
@@ -2460,7 +2457,7 @@ def _index_partials_by_env(partials):
     return by_env
 
 
-def _snapshot_partial_groups(bank, collection_iter):
+def _snapshot_partial_groups(bank: RolloutBank, collection_iter: int) -> None:
     """Snapshot the finished members of partial groups (Phase B), once per window.
 
     Reads each live pipeline's ``_assemble_pending`` while the asyncio loop is idle
