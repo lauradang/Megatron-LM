@@ -13,6 +13,7 @@ from megatron.rl.agent.api import (
     GroupRolloutParams,
     Rollout,
     RolloutGenerator,
+    RolloutGroup,
     RolloutRequest,
     _SubmissionGate,
 )
@@ -85,6 +86,14 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
             )
 
         return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+
+
+def test_grouped_rollout_generator_initializes_rollout_bank():
+    assert MockGenerator()._rollout_bank is None
+
+
+def test_rollout_group_defines_optional_uid():
+    assert RolloutGroup.model_fields["uid"].default is None
 
 
 class CountingRewardAgent(RewardOnlyAgent):
@@ -406,6 +415,70 @@ class TestGroupedRollouts:
         assert [agent.parallel_generation_tasks for agent in mt.agents] == (
             expected_parallel_generation_tasks
         )
+
+    @pytest.mark.asyncio
+    async def test_num_groups_per_env_override_produces_residual_shape(self):
+        """An explicit per-env override bypasses the weight split.
+
+        Used to fill the per-env residual left after injecting restored
+        rollout-bank groups: a residual of 0 for an over-represented env must stay
+        0, not be re-weighted back up.
+        """
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=1.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "c"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+        mt.parallel_generation_tasks = 4
+
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=False,
+            num_groups_per_env={"a": 0, "b": 2, "c": 2},
+        )
+        env_ids = [g[0].env_id async for g in mt.get_grouped_rollouts(request)]
+        # Equal weights alone would give a/b/c ~ [2, 1, 1]; the override forces the
+        # residual shape instead: no env "a", two each of "b" and "c".
+        assert sorted(env_ids) == ["b", "b", "c", "c"]
+
+    @pytest.mark.asyncio
+    async def test_num_groups_per_env_none_matches_weight_split(self):
+        """Regression: omitting the override reproduces the weight-proportional split."""
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+        mt.parallel_generation_tasks = 4
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=False,
+        )
+        env_ids = [g[0].env_id async for g in mt.get_grouped_rollouts(request)]
+        assert sorted(env_ids) == ["a", "a", "a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_num_groups_per_env_rejects_unknown_env(self):
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=1.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=False,
+            num_groups_per_env={"a": 2, "z": 0},
+        )
+        with pytest.raises(ValueError, match="unknown env_id"):
+            async for _ in mt.get_grouped_rollouts(request):
+                pass
 
     @pytest.mark.parametrize(
         "num_groups, all_envs_active",

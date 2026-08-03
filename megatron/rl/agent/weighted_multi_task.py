@@ -21,6 +21,7 @@ from .api import (
     RolloutGenerator,
     RolloutRequest,
 )
+from ..types import GroupsPerEnv
 
 logger = logging.getLogger(__name__)
 
@@ -196,9 +197,65 @@ class WeightedMultiTask(
         all_rollouts_lists = await asyncio.gather(*tasks)
         return [rollout for rollouts in all_rollouts_lists for rollout in rollouts]
 
+    def _env_ids(self) -> list[str]:
+        """Per-agent env_ids"""
+        env_ids = []
+        for i, (a, config) in enumerate(zip(self.agents, self.agent_configs)):
+            env_id = getattr(a, "env_id", None)
+            if not env_id and not config.evaluation_only:
+                raise ValueError(
+                    f"Active agent {i} ({type(a).__name__}) has no env_id; it is "
+                    f"required to weight-balance restored rollout-bank groups by env. "
+                    f"Set env_id for every non-evaluation agent in the environment config."
+                )
+            env_ids.append(env_id or f"agent_{i}")
+        return env_ids
+
+    def env_group_targets(self, total_count: int) -> GroupsPerEnv:
+        """Per-env group counts for a full batch of ``total_count`` groups.
+
+        The weight split (``_distribute_counts``) keyed by env_id and summed over
+        any agents that share an env_id — the whole-batch target used to
+        weight-balance injected restored rollout-bank groups. Living here, beside
+        ``_distribute_counts``/``_env_ids``, keeps this target and the generator's
+        actual split identical. Counts always sum to ``total_count``
+        (weight-proportional, remainder to the largest fractional parts), and
+        agents that share an env_id are merged into one entry.
+
+        Example::
+
+            from examples.rl.environments.math.openmath_agent import OpenMathInstructAgent
+            from examples.rl.environments.math.bigmath_agent import BigMathAgent
+
+            # Two distinct envs (env_id "openmath_instruct" and "bigmath"),
+            # equal weight -> a 10-group batch splits evenly.
+            agent = WeightedMultiTask([
+                AgentConfig(agent_type=OpenMathInstructAgent, agent_args={}, weight=1.0),
+                AgentConfig(agent_type=BigMathAgent, agent_args={}, weight=1.0),
+            ])
+            agent.env_group_targets(10)  # {"openmath_instruct": 5, "bigmath": 5}
+        """
+        target: GroupsPerEnv = {}
+        for eid, c in zip(self._env_ids(), self._distribute_counts(total_count)):
+            target[eid] = target.get(eid, 0) + c
+        return target
+
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
+        override: GroupsPerEnv | None = request.num_groups_per_env
+        if override is not None:
+            # Explicit per-env counts (e.g. the residual after injecting restored rollout-bank groups).
+            env_ids = self._env_ids()
+            unknown = set[Any](override) - set(env_ids)
+            if unknown:
+                raise ValueError(
+                    f"num_groups_per_env references unknown env_id(s) {sorted(unknown)}; "
+                    f"known env_ids: {sorted(set(env_ids))}. "
+                    f"Check that the envs defined in this run are consistent with the restored rollouts."
+                )
+            agent_groups = [override.get(eid, 0) for eid in env_ids]
+        else:
+            agent_groups = self._distribute_counts(request.num_groups)
         # In streaming mode, ensure every active (non-evaluation, non-zero-weight) agent
         # gets a sub-generator even when num_groups < num_active_agents.  Without this,
         # _distribute_counts(1) with 5 equal-weight envs gives [1,0,0,0,0]: only env 0
@@ -241,8 +298,12 @@ class WeightedMultiTask(
         # agent_slots controls how many groups each agent yields per outer-loop round.
         # Derive it from the (possibly corrected) agent_groups so that all active agents
         # participate each round — not just the one that got the remainder in a 1-group request.
-        if request.streaming and any(agent_groups[i] > 0 for i in range(len(agent_groups))
-                                      if not self.agent_configs[i].evaluation_only and self.weights[i] > 0):
+        # With an explicit per-env override, slots must follow the residual shape, not a
+        # weight split of num_groups (which the else-branch would recompute).
+        if override is not None or (
+            request.streaming and any(agent_groups[i] > 0 for i in range(len(agent_groups))
+                                      if not self.agent_configs[i].evaluation_only and self.weights[i] > 0)
+        ):
             raw_slots = list(agent_groups)
         else:
             raw_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
@@ -290,6 +351,7 @@ class WeightedMultiTask(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
                 agent.parallel_generation_tasks = pgt
+                agent._rollout_bank = self._rollout_bank
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
