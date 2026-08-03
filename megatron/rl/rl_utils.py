@@ -350,6 +350,8 @@ class RLRuntimeState:
         self.latest_batch_num_sequences = 0
         self.rollout_bank = None
         self.restored_groups: GroupQueuesPerEnv = {}
+        # Phase B: env_id -> {problem_id: PartialGroupSnapshot}, loaded once at resume.
+        self.restored_partials = {}
         self.bank_restored = False
         self.fresh_overflow: GroupQueuesPerEnv = {}
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
@@ -829,6 +831,13 @@ def get_rollout_generator(
         reset_inflight()
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = _get_or_create_rollout_agent(args, parallel_generation_tasks)
+        # Phase B: hand each sub-agent its restored partial-group snapshots, keyed by
+        # problem_id within the sub-agent's env. Runs once, when the streaming
+        # generator is created — exactly when resume applies.
+        restored_partials = get_rl_runtime_state().restored_partials
+        for sub_agent in (agent.agents if isinstance(agent, WeightedMultiTask) else [agent]):
+            env_id = getattr(sub_agent, "env_id", "") or "rollout"
+            sub_agent._resume_partials = restored_partials.get(env_id, {})
         # When speculative rollout is enabled, inflate rollouts_per_group so the
         # draft engine generates oversample_factor * samples_per_group candidates.
         # A thin async wrapper then down-selects to the original samples_per_group
@@ -1055,6 +1064,9 @@ def get_environment_rollouts(
                     runtime_state.restored_groups: GroupQueuesPerEnv = _bucket_restored_groups(
                         restored_groups, set(target)
                     )
+                    runtime_state.restored_partials = _index_partials_by_env(
+                        bank.restore_partial(args.iteration)
+                    )
                     runtime_state.bank_restored = True
                     total_restored_groups = sum(
                         len(dq) for dq in runtime_state.restored_groups.values()
@@ -1128,6 +1140,12 @@ def get_environment_rollouts(
                     # pull and are correctly decremented here when finally consumed.
                     for group in fresh:
                         remove_inflight(len(group))
+                    # Phase B: the collection window is now quiesced (the asyncio loop
+                    # is idle between anext pulls), so snapshot the finished members of
+                    # any still-partial groups. Streaming-only: one-shot mode drains
+                    # _assemble_pending to empty each window.
+                    if bank is not None and args.rl_partial_rollouts:
+                        _snapshot_partial_groups(bank, args.curr_iteration)
                     # Restored groups first, then freshly generated ones.
                     rollouts = list(inject) + fresh
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
@@ -2434,6 +2452,69 @@ def prep_wandb_metrics(
     return metrics
 
 
+def _index_partials_by_env(partials):
+    """Group restored PartialGroupSnapshots into env_id -> {problem_id: snap}."""
+    by_env: dict = {}
+    for p in partials:
+        by_env.setdefault(p["env_id"], {})[p["problem_id"]] = p
+    return by_env
+
+
+def _snapshot_partial_groups(bank, collection_iter):
+    """Snapshot the finished members of partial groups (Phase B), once per window.
+
+    Reads each live pipeline's ``_assemble_pending`` while the asyncio loop is idle
+    (between anext pulls), so the buckets are race-free. Members are persisted as raw
+    ``InferenceResponse`` dumps — no reward evaluation happens here. Always writes (an
+    empty snapshot clears stale partials whose groups have since completed).
+    """
+    if _ROLLOUT_AGENT is None:
+        return
+    sub_agents = (
+        _ROLLOUT_AGENT.agents if isinstance(_ROLLOUT_AGENT, WeightedMultiTask) else [_ROLLOUT_AGENT]
+    )
+    partials = []
+    for sub_agent in sub_agents:
+        pipeline = getattr(sub_agent, "_active_pipeline", None)
+        if pipeline is None:
+            continue
+        env_id = getattr(sub_agent, "env_id", "") or "rollout"
+        n = pipeline.request.rollouts_per_group
+        for bucket in pipeline._assemble_pending.values():
+            if not bucket:
+                continue
+            params = bucket[0].item.params
+            golden = getattr(params, "golden", None)
+            problem_id = golden.get("problem_id") if isinstance(golden, dict) else None
+            if problem_id is None:
+                continue  # identity match needs a problem_id; else the whole group regenerates
+            try:
+                req_dump = params.inference_request.model_dump()
+                json.dumps(golden)  # serializability guard
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping partial snapshot for %s: unserializable golden/request", problem_id
+                )
+                continue
+            partials.append(
+                {
+                    "partial_uid": f"{env_id}:{problem_id}",
+                    "env_id": env_id,
+                    "problem_id": problem_id,
+                    "inference_request": req_dump,
+                    "golden": golden,
+                    "rollouts_per_group": n,
+                    "batch_id": bucket[0].item.batch_id,
+                    "index_in_batch": bucket[0].item.index_in_batch,
+                    "finished_members": [
+                        {"rollout_idx": it.item.rollout_idx, "response": it.response.model_dump()}
+                        for it in bucket
+                    ],
+                }
+            )
+    bank.snapshot_partial(partials, collection_iter)
+
+
 def _collect_rollout_pipeline_metrics() -> dict:
     """Snapshot per-pipeline instrumentation into wandb-loggable scalars.
 
@@ -2463,6 +2544,8 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
             f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
             f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+            # Phase B: partial groups that the next quiesce snapshot would persist.
+            f"{env_id}_pipeline_partial_snapshot_groups": len(pipeline._assemble_pending),
             f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
             f"{env_id}_pipeline_gate_capacity": gate.capacity,
             f"{env_id}_pipeline_gate_held": gate.held,

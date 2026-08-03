@@ -290,6 +290,7 @@ class TestRLUtils:
         runtime_state = SimpleNamespace(
             bank_restored=False,
             restored_groups=deque(),
+            restored_partials={},
         )
 
         class Bank:
@@ -299,6 +300,13 @@ class TestRLUtils:
             def restore(self, iteration):
                 assert iteration == 10
                 return restored
+
+            def restore_partial(self, iteration):
+                assert iteration == 10
+                return []
+
+            def snapshot_partial(self, partials, collection_iter):
+                assert collection_iter == 11
 
             def mark_consumed(self, uid, iteration):
                 assert uid

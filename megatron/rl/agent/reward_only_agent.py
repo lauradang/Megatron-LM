@@ -291,9 +291,29 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             prompt, request.generation_args
         )
 
+        # Phase B resume: if this re-served row has a saved partial snapshot (matched
+        # by problem_id), attach its finished members so stage_prepare regenerates
+        # only the missing ones. get_prompt re-derives the same golden for the same
+        # row, so rewards for both finished and regenerated members stay consistent.
+        resume_members = None
+        partial_uid = None
+        resume_map = getattr(self, "_resume_partials", None)
+        problem_id = golden.get("problem_id") if isinstance(golden, dict) else None
+        if resume_map and problem_id is not None:
+            snap = resume_map.pop(problem_id, None)  # pop: match each saved partial once
+            if snap is not None:
+                partial_uid = snap["partial_uid"]
+                resume_members = [
+                    (m["rollout_idx"], InferenceResponse.model_validate(m["response"]))
+                    for m in snap["finished_members"]
+                ]
+
         return GroupRolloutParams(
             inference_request=inference_request,
             build_rollout=functools.partial(self._rollout_from_response, request, golden=golden),
+            golden=golden,
+            resume_members=resume_members,
+            partial_uid=partial_uid,
         )
 
     async def _evaluation(

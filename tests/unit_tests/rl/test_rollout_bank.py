@@ -18,8 +18,9 @@ import pytest
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.rl import rl_utils, rollout_bank
-from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
+from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
+from megatron.rl.inference.api import InferenceResponse, LLMChatMessage
 from megatron.rl.rollout_bank import (
     _CONSUMED,
     _FORMAT_VERSION,
@@ -670,3 +671,190 @@ class TestRestoreBalancing:
         inject, residual = rl_utils._plan_restore_injection(target, buckets)
         assert inject == {"a": 2, "b": 0, "c": 0}
         assert residual == {"a": 0, "b": 2, "c": 2}
+
+
+# ------------------------------------------------------ Phase B: partial groups
+
+
+def make_partial_snapshot(problem_id="p", env_id="test", n=2, finished=1, token=False):
+    """Build a PartialGroupSnapshot dict for the storage-layer tests."""
+    if token:
+        resp = {
+            "response": {"role": "assistant", "content": "t0"},
+            "token_ids": [1, 2, 3],
+            "prompt_length": 1,
+            "logprobs": [-0.1, -0.2, -0.3],
+            "finish_reason": "stop",
+            "policy_epoch": [[0, 0]],
+            "kv_cache_epoch": [[0, 0]],
+            "num_evictions": 0,
+        }
+    else:
+        resp = {
+            "response": {"role": "assistant", "content": "t0"},
+            "raw_text": "t0",
+            "finish_reason": "stop",
+            "policy_epoch": [[0, 0]],
+            "kv_cache_epoch": [[0, 0]],
+            "num_evictions": 0,
+        }
+    return {
+        "partial_uid": f"{env_id}:{problem_id}",
+        "env_id": env_id,
+        "problem_id": problem_id,
+        "inference_request": {"prompt": [{"role": "user", "content": "hi"}], "tools": None},
+        "golden": {"problem_id": problem_id, "answer": 1},
+        "rollouts_per_group": n,
+        "batch_id": 0,
+        "index_in_batch": 0,
+        "finished_members": [{"rollout_idx": i, "response": resp} for i in range(finished)],
+    }
+
+
+class TestPartialSnapshot:
+    """Storage-layer round trip, durability, compaction, and dedup for Phase B."""
+
+    def test_round_trip(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.snapshot_partial([make_partial_snapshot("p0"), make_partial_snapshot("p1")], 0)
+        restored = RolloutBank(str(tmp_path)).restore_partial(trained_through=0)
+        assert {s["problem_id"] for s in restored} == {"p0", "p1"}
+        member = restored[0]["finished_members"][0]["response"]
+        assert member["raw_text"] == "t0"
+
+    def test_token_member_round_trip(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.snapshot_partial([make_partial_snapshot("p", token=True)], 0)
+        restored = RolloutBank(str(tmp_path)).restore_partial(0)
+        resp = restored[0]["finished_members"][0]["response"]
+        assert resp["token_ids"] == [1, 2, 3]
+        assert resp["logprobs"] == [-0.1, -0.2, -0.3]
+
+    def test_empty_snapshot_clears_stale_partials(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.snapshot_partial([make_partial_snapshot()], 0)
+        bank.snapshot_partial([], 1)  # group completed -> next window clears it
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == []
+
+    def test_missing_snapshot_returns_empty(self, tmp_path):
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == []
+
+    def test_torn_snapshot_dropped(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.snapshot_partial([make_partial_snapshot()], 0)
+        with open(bank._inflight_path, "r+") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.truncate(size // 2)
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == []
+
+    def test_checksum_mismatch_dropped(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.snapshot_partial([make_partial_snapshot()], 0)
+        with open(bank._inflight_path) as f:
+            payload = json.load(f)
+        payload["partials"][0]["problem_id"] = "tampered"
+        with open(bank._inflight_path, "w") as f:
+            json.dump(payload, f)
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == []
+
+    def test_atomic_replace_survives_kill_mid_write(self, tmp_path, monkeypatch):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.snapshot_partial([make_partial_snapshot("old")], 0)
+
+        def boom(src, dst):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(rollout_bank.os, "replace", boom)
+        with pytest.raises(KeyboardInterrupt):
+            bank.snapshot_partial([make_partial_snapshot("new")], 1)
+        # The previous complete snapshot is intact (atomic rename never happened).
+        restored = RolloutBank(str(tmp_path)).restore_partial(0)
+        assert [s["problem_id"] for s in restored] == ["old"]
+
+    def test_compaction_leaves_snapshot_intact(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.append(sample_group())
+        bank.snapshot_partial([make_partial_snapshot("p")], 0)
+        bank.checkpoint(0)  # rewrites/prunes gen-<iter>/ segments; must not touch inflight.json
+        restored = RolloutBank(str(tmp_path)).restore_partial(0)
+        assert [s["problem_id"] for s in restored] == ["p"]
+
+    def test_completed_partial_not_double_restored(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.append(sample_group(), partial_uid="test:p")  # completed-from-resume record
+        bank.snapshot_partial([make_partial_snapshot("p")], 0)  # stale snapshot
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == []
+
+    def test_partial_uid_survives_compaction(self, tmp_path):
+        # A group completed from resume keeps its partial_uid across a compaction, so
+        # a stale snapshot restored after a later kill is still deduped out.
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.append(sample_group(), partial_uid="test:p")
+        bank.checkpoint(0)
+        assert "test:p" in RolloutBank(str(tmp_path))._completed_partial_uids()
+
+
+class ResumingMockGenerator(MockGenerator):
+    """MockGenerator whose first group resumes from one saved member."""
+
+    def __init__(self, saved_response, **kwargs):
+        super().__init__(**kwargs)
+        self._saved = saved_response
+        self.inferences = 0
+
+    async def get_rollout_response(self, request, inference_request):
+        self.inferences += 1
+        return await super().get_rollout_response(request, inference_request)
+
+    async def prepare_group_rollout(self, request):
+        params = await super().prepare_group_rollout(request)
+        if self.prepare_group_rollout_calls == 1:  # first group resumes
+            return params._replace(resume_members=[(0, self._saved)], partial_uid="test:0")
+        return params
+
+
+class TestPartialResumeIntegration:
+    """Resume through the real _RolloutPipeline: only missing members regenerate."""
+
+    def test_resumes_missing_members_only(self, tmp_path):
+        async def run():
+            saved = InferenceResponse(
+                response=LLMChatMessage(role="assistant", content="t99"),
+                raw_text="t99",
+                finish_reason="stop",
+                policy_epoch=[(0, 0)],
+                kv_cache_epoch=[(0, 0)],
+                num_evictions=0,
+            )
+            gen = ResumingMockGenerator(saved_response=saved, parallel_generation_tasks=8)
+            bank = RolloutBank(str(tmp_path))
+            bank.set_collection(0)
+            gen._rollout_bank = bank
+            req = GroupedRolloutRequest(
+                num_groups=2,
+                rollouts_per_group=2,
+                inference_interface=MockInferenceInterface(),
+                submission_granularity="B",
+                consumption_granularity="B",
+            )
+            groups = [g async for g in gen.get_grouped_rollouts(req)]
+            bank.close()
+            return gen, groups
+
+        gen, groups = asyncio.run(run())
+        assert len(groups) == 2
+        # group0: 1 saved + 1 generated; group1: 2 generated => 3 inferences, not 4.
+        assert gen.inferences == 3
+        resumed = next(g for g in groups if any(r.trajectory == ["t99"] for r in g.rollouts))
+        assert len(resumed.rollouts) == 2  # completed to full size N
+        # The completed-from-resume group recorded its partial_uid for dedup.
+        assert "test:0" in RolloutBank(str(tmp_path))._completed_partial_uids()

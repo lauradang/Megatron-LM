@@ -3,7 +3,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeAlias, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeAlias, TypeVar
 
 import numpy as np
 
@@ -66,6 +66,13 @@ class GroupRolloutParams(NamedTuple):
 
     inference_request: InferenceRequest
     build_rollout: Callable[[InferenceResponse], Awaitable[Rollout]]
+    # Phase B (partial-group resume). golden is surfaced explicitly so the
+    # once-per-window snapshot never introspects the build_rollout closure.
+    golden: Any = None
+    # Set when this group is being completed from a restored partial snapshot:
+    # the already-finished members (by rollout_idx) and the stable dedup id.
+    resume_members: list[tuple[int, InferenceResponse]] | None = None
+    partial_uid: str | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -322,12 +329,36 @@ class _RolloutPipeline:
                     await self.gate.acquire_for("G")
                     params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
 
+                    # Phase B resume: members finished before a kill are restored here
+                    # so only the missing indices regenerate.
+                    resume = {idx: resp for idx, resp in (params.resume_members or [])}
+
                     # This group's rollouts now enter flight (generation starting).
                     # They leave it when consumed into a training batch (rollout
                     # consumer) or dropped by the all-equal-reward filter in
                     # stage_assemble.
                     add_inflight(self.request.rollouts_per_group)
+
+                    if resume:
+                        # Seed the assembly bucket with the restored finished members;
+                        # the bucket then fills to N and stage_assemble builds + banks it
+                        # unchanged. No gate "R" slot is taken for a seeded member (none
+                        # is released for it either, since it never reaches _infer_one).
+                        # This loop has no await, so it is atomic w.r.t. stage_assemble.
+                        bucket = self._assemble_pending.setdefault(group_id, [])
+                        for saved_idx, saved_response in resume.items():
+                            seed = _InferWorkItem(
+                                group_id=group_id,
+                                rollout_idx=saved_idx,
+                                batch_id=batch_id,
+                                index_in_batch=index_in_batch,
+                                params=params,
+                            )
+                            bucket.append(_InferredItem(item=seed, response=saved_response))
+
                     for rollout_idx in range(self.request.rollouts_per_group):
+                        if rollout_idx in resume:
+                            continue  # already restored; do not re-generate
                         await self.gate.acquire_for("R")
                         item = _InferWorkItem(
                             group_id=group_id,
@@ -426,7 +457,11 @@ class _RolloutPipeline:
                         index_in_batch=first.item.index_in_batch,
                     )
                     if self.bank is not None:
-                        group.uid = self.bank.append(group)
+                        # Record the partial_uid when this group was completed from a
+                        # restored partial snapshot, so restore drops the stale entry.
+                        group.uid = self.bank.append(
+                            group, partial_uid=getattr(first.item.params, "partial_uid", None)
+                        )
                     await self.output_queue.put(group)
                 else:
                     # Filtered out (all-equal reward): these rollouts are dropped

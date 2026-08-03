@@ -73,6 +73,7 @@ _CONSUMED = "consumed.log"
 _TOKENS_BIN = "tokens.bin"
 _LOGPROBS_BIN = "logprobs.bin"
 _MASKS_BIN = "masks.bin"
+_INFLIGHT = "inflight.json"
 
 
 class SidecarMeta(TypedDict):
@@ -116,7 +117,53 @@ class LedgerRecord(TypedDict):
     tok: NotRequired[SidecarMeta]
     lp: NotRequired[SidecarMeta]
     mask: NotRequired[SidecarMeta]
+    # Set only on a group completed from a restored partial snapshot (Phase B).
+    # restore_partial() drops any snapshot partial whose partial_uid appears on a
+    # completed ledger record, giving exactly-once across a complete-then-crash.
+    partial_uid: NotRequired[str]
     checksum: NotRequired[str]
+
+
+class PartialMember(TypedDict):
+    """One finished-but-ungrouped member of a partial group (raw response).
+
+    Args:
+        rollout_idx: The member's index within its group (0 .. rollouts_per_group-1).
+        response: ``InferenceResponse.model_dump()`` for the finished member. Stored
+            raw (not a built Rollout) so the snapshot performs zero reward evaluation;
+            rebuild happens for free when stage_assemble runs build_rollout on the
+            re-seeded bucket at completion.
+    """
+
+    rollout_idx: int
+    response: dict
+
+
+class PartialGroupSnapshot(TypedDict):
+    """A partial group's finished members plus what is needed to complete it.
+
+    Args:
+        partial_uid: Stable ``f"{env_id}:{problem_id}"`` identity used for exactly-once
+            dedup against completed ledger records.
+        env_id: The environment/sub-agent the group belongs to.
+        problem_id: The dataset-row identity used to re-attach on resume.
+        inference_request: ``InferenceRequest.model_dump()`` (the prompt).
+        golden: The dataset reward answer (JSON-serializable).
+        rollouts_per_group: Target group size N at snapshot time.
+        batch_id: Observability; reassigned when the group is re-served on resume.
+        index_in_batch: Observability; reassigned on resume.
+        finished_members: The finished members captured this window.
+    """
+
+    partial_uid: str
+    env_id: str
+    problem_id: str
+    inference_request: dict
+    golden: dict
+    rollouts_per_group: int
+    batch_id: int
+    index_in_batch: int
+    finished_members: list[PartialMember]
 
 
 class Manifest(TypedDict):
@@ -225,6 +272,10 @@ class RolloutBank:
     def _consumed_path(self) -> str:
         return os.path.join(self.bank_dir, _CONSUMED)
 
+    @property
+    def _inflight_path(self) -> str:
+        return os.path.join(self.bank_dir, _INFLIGHT)
+
     def _read_manifest(self) -> Manifest:
         try:
             with open(self._manifest_path) as f:
@@ -326,11 +377,15 @@ class RolloutBank:
         self._close_handles()
 
     # ---------------------------------------------------------------- append
-    def append(self, group: "RolloutGroup", uid: str | None = None) -> str:
+    def append(
+        self, group: "RolloutGroup", uid: str | None = None, partial_uid: str | None = None
+    ) -> str:
         """Write-through one completed group; return its stable uid.
 
         A uid is assigned for a new group or preserved when rewriting an
-        existing group during compaction.
+        existing group during compaction. ``partial_uid`` is recorded when the group
+        was completed from a restored partial snapshot (Phase B), so restore can drop
+        the now-stale snapshot entry (exactly-once).
         """
         assert self._seg_dir is not None, "set_collection() must be called before append()"
         current_seg = _segment_name(self._collection_iter)
@@ -343,6 +398,8 @@ class RolloutBank:
                 self._seq = max(self._seq, int(uid_seq) + 1)
 
         record, tok_bytes, lp_bytes, mask_bytes = self._encode(group, uid)
+        if partial_uid is not None:
+            record["partial_uid"] = partial_uid  # inside the checksum below
         # Write sidecar slices first, then the index record that points at them,
         # so a torn write can only ever lose the trailing index line.
         if tok_bytes:
@@ -516,6 +573,83 @@ class RolloutBank:
                     restored.append(group)
         return restored
 
+    # ------------------------------------------------ partial snapshot (Phase B)
+    def snapshot_partial(
+        self, partials: list["PartialGroupSnapshot"], collection_iter: int
+    ) -> None:
+        """Atomically replace the partial-group snapshot (once per collection window).
+
+        Unlike the write-through ledger this is a whole-file, latest-wins snapshot of
+        the finished-but-ungrouped members still in the pipeline's ``_assemble_pending``;
+        a kill loses at most one window. Stored at the bank root so compaction (which
+        rewrites/prunes ``gen-<iter>/`` segments) never touches it. An empty list is a
+        valid snapshot — it clears stale partials once their groups have completed.
+
+        Args:
+            partials: The partial groups to persist (may be empty).
+            collection_iter: The collection this snapshot was taken during.
+        """
+        payload = {
+            "format_version": _FORMAT_VERSION,
+            "collection_iter": collection_iter,
+            "partials": partials,
+        }
+        payload["checksum"] = _checksum({k: v for k, v in payload.items() if k != "checksum"})
+        tmp = self._inflight_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._inflight_path)  # atomic flip
+        _fsync_directory(self.bank_dir)
+
+    def restore_partial(self, trained_through: int) -> list["PartialGroupSnapshot"]:
+        """Return saved partial groups still worth resuming.
+
+        Drops any partial whose ``partial_uid`` was already recorded on a completed
+        ledger record (the complete-then-crash case: that work is a Phase A complete
+        group now, so re-resuming would double-generate). Returns ``[]`` on a torn,
+        missing, wrong-version, or checksum-bad snapshot (fail-safe).
+
+        Args:
+            trained_through: The resumed checkpoint step (accepted for symmetry with
+                ``restore``; the ledger dedup is what makes resume correct here).
+        """
+        payload = self._read_inflight()
+        if payload is None:
+            return []
+        completed = self._completed_partial_uids()
+        return [p for p in payload["partials"] if p["partial_uid"] not in completed]
+
+    def _read_inflight(self) -> Optional[dict]:
+        """Read + validate the inflight snapshot, or None if unreadable/incompatible."""
+        path = self._inflight_path
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+            _validate_format_version(payload, path)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Dropping unreadable/incompatible inflight snapshot at %s", path)
+            return None
+        expected = _checksum({k: v for k, v in payload.items() if k != "checksum"})
+        if expected != payload.get("checksum"):
+            logger.warning("Inflight snapshot checksum mismatch at %s; dropping", path)
+            return None
+        return payload
+
+    def _completed_partial_uids(self) -> set:
+        """partial_uids recorded on completed ledger records across all segments."""
+        seen: set = set()
+        for seg in self._read_manifest()["segments"]:
+            seg_dir = os.path.join(self.bank_dir, seg)
+            for record in self._read_ledger(seg_dir):
+                pid = record.get("partial_uid")
+                if pid:
+                    seen.add(pid)
+        return seen
+
     def _read_markers(self, seg_dir: str) -> dict:
         """
         Load consumption markers from a directory.
@@ -622,6 +756,7 @@ class RolloutBank:
                 index_in_batch=group_dict.get("index_in_batch", 0),
             )
             group.uid = uid
+            group.partial_uid = record.get("partial_uid")  # carried across compaction
             return group
 
         # token kind: re-split flat sidecar arrays back into jagged per-turn lists
@@ -649,6 +784,7 @@ class RolloutBank:
             index_in_batch=group_dict.get("index_in_batch", 0),
         )
         group.uid = uid
+        group.partial_uid = record.get("partial_uid")  # carried across compaction
         return group
 
     @staticmethod
@@ -730,7 +866,9 @@ class RolloutBank:
         self._ledger_f = self._tok_f = self._lp_f = self._mask_f = None
         try:
             for group in groups:
-                self.append(group, uid=group.uid)  # reuses the write-through encoder + fsync
+                self.append(  # reuses the write-through encoder + fsync
+                    group, uid=group.uid, partial_uid=getattr(group, "partial_uid", None)
+                )
         finally:
             self._close_handles()
             (self._seg_dir, self._collection_iter, self._seq,
