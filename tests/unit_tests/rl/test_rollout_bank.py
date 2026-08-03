@@ -834,6 +834,19 @@ class TestPartialSnapshot:
         bank.checkpoint(0)
         assert "test:p" in RolloutBank(str(tmp_path))._completed_partial_uids()
 
+    def test_unclaimed_restored_partial_survives_next_snapshot(self, tmp_path, monkeypatch):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        snapshot = make_partial_snapshot("p", uid="unclaimed")
+        agent = RepeatingProblemAgent()
+        agent._resume_partials = {"p": [snapshot]}
+        assert getattr(agent, "_active_pipeline", None) is None
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", agent)
+
+        rl_utils._snapshot_partial_groups(bank, 1)
+
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == [snapshot]
+
     def test_repeated_rows_and_shared_env_agents_keep_distinct_occurrences(self):
         async def run():
             indexed = rl_utils._index_partials_by_env(

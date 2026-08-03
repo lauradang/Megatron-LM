@@ -16,6 +16,7 @@ from ..inference import (
     ReturnsRaw,
     ReturnsTokens,
 )
+from ..types import PartialsByProblemId
 from .api import (
     EvaluationAgent,
     EvaluationRequest,
@@ -52,7 +53,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
     env_id: str | None = None
     max_turns: int = 1
-    _resume_partials: dict | None = PrivateAttr(default=None)
+    _resume_partials: PartialsByProblemId | None = PrivateAttr(default=None)
 
     def get_dataset(self, validation: bool = False):
         """Return validation or train dataset."""

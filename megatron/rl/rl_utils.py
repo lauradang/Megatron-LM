@@ -83,6 +83,7 @@ from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.inflight_tracker import inflight_snapshot, remove_inflight, reset_inflight
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_bank import RolloutBank
 from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
@@ -100,7 +101,7 @@ from megatron.rl.sequence_packing_utils import (
     update_microbatch_calculator,
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
-from megatron.rl.rollout_bank import PartialGroupSnapshot, RestoredPartials, RolloutBank
+from megatron.rl.types import PartialGroupSnapshot, RestoredPartialsByAgent, PartialMember
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
@@ -351,7 +352,7 @@ class RLRuntimeState:
         self.latest_batch_num_sequences = 0
         self.rollout_bank = None
         self.restored_groups: GroupQueuesPerEnv = {}
-        self.restored_partials: RestoredPartials = {}
+        self.restored_partials: RestoredPartialsByAgent = {}
         self.bank_restored = False
         self.fresh_overflow: GroupQueuesPerEnv = {}
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
@@ -2450,7 +2451,7 @@ def prep_wandb_metrics(
     return metrics
 
 
-def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> RestoredPartials:
+def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> RestoredPartialsByAgent:
     """
     Index snapshots without collapsing repeated rows or shared-env agents.
 
@@ -2458,7 +2459,7 @@ def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> RestoredPart
         partials: A list of PartialGroupSnapshot objects.
 
     Returns:
-        A dictionary of RestoredPartials.
+        Restored partial snapshots indexed by agent and then problem ID.
 
     Example:
         partials = [
@@ -2468,7 +2469,7 @@ def _index_partials_by_env(partials: list[PartialGroupSnapshot]) -> RestoredPart
         ]
         return {("env1", 0): {"problem1": [PartialGroupSnapshot(partial_uid="123", agent_index=0, ...)], "problem2": [PartialGroupSnapshot(partial_uid="456", agent_index=0, ...)]}, ("env2", 1): {"problem1": [PartialGroupSnapshot(partial_uid="789", agent_index=1, ...)]}}
     """
-    by_env: RestoredPartials = {}
+    by_env: RestoredPartialsByAgent = {}
     for p in partials:
         agent_key = (p["env_id"], p.get("agent_index", 0))
         by_problem = by_env.setdefault(agent_key, {})
@@ -2489,8 +2490,12 @@ def _snapshot_partial_groups(bank: RolloutBank, collection_iter: int) -> None:
     sub_agents = (
         _ROLLOUT_AGENT.agents if isinstance(_ROLLOUT_AGENT, WeightedMultiTask) else [_ROLLOUT_AGENT]
     )
-    partials = []
+    partials_by_uid: dict[str, PartialGroupSnapshot] = {}
     for agent_index, sub_agent in enumerate(sub_agents):
+        for snapshots in (getattr(sub_agent, "_resume_partials", None) or {}).values():
+            for snapshot in snapshots:
+                partials_by_uid[snapshot["partial_uid"]] = snapshot
+
         pipeline = getattr(sub_agent, "_active_pipeline", None)
         if pipeline is None:
             continue
@@ -2512,24 +2517,24 @@ def _snapshot_partial_groups(bank: RolloutBank, collection_iter: int) -> None:
                     "Skipping partial snapshot for %s: unserializable golden/request", problem_id
                 )
                 continue
-            partials.append(
-                {
-                    "partial_uid": params.partial_uid,
-                    "env_id": env_id,
-                    "agent_index": agent_index,
-                    "problem_id": problem_id,
-                    "inference_request": req_dump,
-                    "golden": golden,
-                    "rollouts_per_group": n,
-                    "batch_id": bucket[0].item.batch_id,
-                    "index_in_batch": bucket[0].item.index_in_batch,
-                    "finished_members": [
-                        {"rollout_idx": it.item.rollout_idx, "response": it.response.model_dump()}
-                        for it in bucket
-                    ],
-                }
+            finished_members: list[PartialMember] = [
+                {"rollout_idx": it.item.rollout_idx, "response": it.response.model_dump()}
+                for it in bucket
+            ]
+            partial = PartialGroupSnapshot(
+                partial_uid=params.partial_uid,
+                env_id=env_id,
+                agent_index=agent_index,
+                problem_id=problem_id,
+                inference_request=req_dump,
+                golden=golden,
+                rollouts_per_group=n,
+                batch_id=bucket[0].item.batch_id,
+                index_in_batch=bucket[0].item.index_in_batch,
+                finished_members=finished_members,
             )
-    bank.snapshot_partial(partials, collection_iter)
+            partials_by_uid[partial["partial_uid"]] = partial
+    bank.snapshot_partial(list(partials_by_uid.values()), collection_iter)
 
 
 def _collect_rollout_pipeline_metrics() -> dict:
