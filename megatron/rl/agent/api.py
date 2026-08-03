@@ -3,7 +3,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeAlias, TypeVar
 
 import numpy as np
 
@@ -21,7 +21,17 @@ from ..inference import (
 from ..inflight_tracker import add_inflight, remove_inflight
 from ..rollout_bank import RolloutBank
 from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
-from ..types import AgentBaseModel, GroupedRollouts, Rollout, RolloutGroup, Rollouts, TokenRollout
+from ..types import (
+    AgentBaseModel,
+    EnvId,
+    GroupedRollouts,
+    GroupQueuesPerEnv,
+    GroupsPerEnv,
+    Rollout,
+    RolloutGroup,
+    Rollouts,
+    TokenRollout,
+)
 
 
 # TODO: Move these models to ``megatron.rl.types`` after moving ``Request``,
@@ -45,6 +55,7 @@ class GroupedRolloutRequest(Request):
     streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
+    num_groups_per_env: GroupsPerEnv | None = None
 
 
 class GroupRolloutParams(NamedTuple):
