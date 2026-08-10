@@ -735,8 +735,7 @@ class RepeatingProblemAgent(RewardOnlyAgent):
 
 
 class CountingMockInferenceInterface(MockInferenceInterface):
-    def __init__(self):
-        self.calls = 0
+    calls: int = 0
 
     async def base_generate(self, request):
         self.calls += 1
