@@ -101,7 +101,7 @@ from megatron.rl.sequence_packing_utils import (
     update_microbatch_calculator,
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
-from megatron.rl.types import PartialGroupSnapshot, RestoredPartialsByAgent, PartialMember
+from megatron.rl.types import PartialGroupSnapshot, PartialMember, RestoredPartialsByAgent
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
@@ -2537,6 +2537,66 @@ def _snapshot_partial_groups(bank: RolloutBank, collection_iter: int) -> None:
     bank.snapshot_partial(list(partials_by_uid.values()), collection_iter)
 
 
+def _collect_nemogym_resume_metrics() -> dict:
+    """Summarize durable NeMo Gym episode checkpoints for W&B.
+
+    The Gym agent atomically replaces checkpoint JSON files, so reading the
+    shared checkpoint directory here is safe while rollouts are still running.
+    These are cumulative run-level counters: in particular, a non-zero
+    ``resume_event_count`` is direct evidence that at least one episode was
+    restored after its original Gym process disappeared.
+    """
+    checkpoint_root = os.environ.get("NEMOGYM_EPISODE_CHECKPOINT_DIR")
+    if not checkpoint_root:
+        return {}
+
+    episodes_dir = Path(checkpoint_root) / "episodes"
+    checkpoints = []
+    invalid_count = 0
+    if episodes_dir.is_dir():
+        for checkpoint_path in episodes_dir.rglob("*.json"):
+            try:
+                checkpoints.append(json.loads(checkpoint_path.read_text()))
+            except (OSError, json.JSONDecodeError):
+                invalid_count += 1
+                logger.warning(
+                    "Could not read NeMo Gym episode checkpoint %s",
+                    checkpoint_path,
+                    exc_info=True,
+                )
+
+    resume_counts = [int(checkpoint.get("resume_count", 0)) for checkpoint in checkpoints]
+    restart_counts = [int(checkpoint.get("restart_count", 0)) for checkpoint in checkpoints]
+    completed = [checkpoint for checkpoint in checkpoints if checkpoint.get("status") == "completed"]
+    metrics = {
+        "nemogym_resume/checkpoint_count": len(checkpoints),
+        "nemogym_resume/in_progress_count": sum(
+            checkpoint.get("status") == "in_progress" for checkpoint in checkpoints
+        ),
+        "nemogym_resume/completed_count": len(completed),
+        "nemogym_resume/resumed_episode_count": sum(count > 0 for count in resume_counts),
+        "nemogym_resume/completed_resumed_episode_count": sum(
+            int(checkpoint.get("resume_count", 0)) > 0 for checkpoint in completed
+        ),
+        "nemogym_resume/resume_event_count": sum(resume_counts),
+        "nemogym_resume/max_resume_count": max(resume_counts, default=0),
+        "nemogym_resume/restarted_episode_count": sum(count > 0 for count in restart_counts),
+        "nemogym_resume/restart_event_count": sum(restart_counts),
+        "nemogym_resume/invalid_checkpoint_count": invalid_count,
+    }
+    logger.info(
+        "NeMo Gym resume metrics: checkpoints=%d completed=%d in_progress=%d "
+        "resumed_episodes=%d resume_events=%d max_resume_count=%d",
+        metrics["nemogym_resume/checkpoint_count"],
+        metrics["nemogym_resume/completed_count"],
+        metrics["nemogym_resume/in_progress_count"],
+        metrics["nemogym_resume/resumed_episode_count"],
+        metrics["nemogym_resume/resume_event_count"],
+        metrics["nemogym_resume/max_resume_count"],
+    )
+    return metrics
+
+
 def _collect_rollout_pipeline_metrics() -> dict:
     """Snapshot per-pipeline instrumentation into wandb-loggable scalars.
 
@@ -2546,14 +2606,14 @@ def _collect_rollout_pipeline_metrics() -> dict:
     reading; point-in-time values (queue sizes, gate held) are re-read next
     call. Keys follow the existing f"{env_id}_{metric}" convention.
     """
+    metrics: dict = _collect_nemogym_resume_metrics()
     if _ROLLOUT_AGENT is None:
-        return {}
+        return metrics
     sub_agents = (
         _ROLLOUT_AGENT.agents
         if isinstance(_ROLLOUT_AGENT, WeightedMultiTask)
         else [_ROLLOUT_AGENT]
     )
-    metrics: dict = {}
     for sub_agent in sub_agents:
         pipeline = getattr(sub_agent, "_active_pipeline", None)
         if pipeline is None:
