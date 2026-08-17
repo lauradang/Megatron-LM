@@ -9,11 +9,6 @@ from pydantic import BaseModel
 #: (see ``WeightedMultiTask._env_ids``).
 EnvId: TypeAlias = str
 
-#: Maps each ``EnvId`` to the number of groups to generate for that env. Used to
-#: override the default weight-proportional split of ``num_groups``.
-GroupsPerEnv: TypeAlias = dict[EnvId, int]
-
-
 class AgentBaseModel(BaseModel, extra='allow'):
     """Base model for agent data types."""
 
@@ -72,6 +67,6 @@ class RolloutGroup(AgentBaseModel):
 GroupedRollouts = list[RolloutGroup]
 
 #: Maps each ``EnvId`` to a FIFO queue of completed ``RolloutGroup``s for that env.
-#: Used by the durable rollout bank to bucket restored groups (and buffer streaming
-#: overflow) per env so injection can respect per-env weight targets.
+#: Used by ``WeightedMultiTask`` to consume restored groups before generating fresh
+#: groups for the same environment.
 GroupQueuesPerEnv: TypeAlias = dict[EnvId, deque[RolloutGroup]]
