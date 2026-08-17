@@ -305,6 +305,8 @@ class _RolloutPipeline:
         self.inferred_count = 0
         self.assembled_count = 0
         self.yielded_count = 0
+        self.refilled_placeholder_groups = 0
+        self.refilled_placeholder_batches = 0
 
     async def stage_prepare(self) -> None:
         """Generate gated inference work items."""
@@ -402,6 +404,25 @@ class _RolloutPipeline:
                     *[item.item.params.build_rollout(item.response) for item in completed]
                 )
                 self.assembled_count += 1
+                # G-consumption yields groups in completion order. Infrastructure
+                # failures return much faster than successful agent episodes, so
+                # an early training batch can otherwise contain only rectangular
+                # empty-trajectory placeholders even when slower valid groups are
+                # still running. In streaming mode, drop such groups and release
+                # their G gate slot; stage_prepare remains active and naturally
+                # generates a replacement.
+                all_placeholders = all(
+                    not getattr(rollout, "trajectory", None) for rollout in rollouts
+                )
+                if (
+                    self.request.streaming
+                    and not self.gran_policy.prevent_dataset_reorder
+                    and all_placeholders
+                ):
+                    remove_inflight(len(rollouts))
+                    self.gate.release_for("G")
+                    self.refilled_placeholder_groups += 1
+                    continue
                 # NOTE: this filter is currently non-functional dead code:
                 # _GranularityConfig._validate rejects filter_groups_with_same_reward
                 # at pipeline construction, so `keep` is always True. Kept for a
@@ -471,6 +492,23 @@ class _RolloutPipeline:
                 batch = pending.pop(next_batch_id)
                 batch.sort(key=lambda group: group.index_in_batch)
                 next_batch_id += 1
+                # Batch consumption must preserve group ordering, so an
+                # individual placeholder group cannot be dropped without
+                # leaving a permanent hole. Keep partially valid batches
+                # unchanged, but refill a batch when every rollout in every
+                # group is an empty infrastructure placeholder.
+                all_placeholders = all(
+                    not getattr(rollout, "trajectory", None)
+                    for group in batch
+                    for rollout in group
+                )
+                if self.request.streaming and all_placeholders:
+                    for group in batch:
+                        remove_inflight(len(group))
+                        self.gate.release_for("G")
+                    self.gate.release_for("B")
+                    self.refilled_placeholder_batches += 1
+                    continue
                 for group in batch:
                     yield group
                     self.gate.release_for("G")

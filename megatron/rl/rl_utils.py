@@ -337,6 +337,8 @@ class RolloutStats:
     # Per-rollout identity (grouped like rewards), used to label the rollout table.
     rollout_env_ids: list[list[str]]
     problem_ids: list[list[str | None]]
+    rollout_statuses: list[list[str]]
+    failure_reasons: list[list[str | None]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -1814,15 +1816,31 @@ def calculate_grpo_advantages(
     override is applied to the advantages tensor after normalization.
     """
 
-    rewards = np.array(rewards)
+    rewards = np.asarray(rewards, dtype=np.float64)
+    num_turns = np.asarray(num_turns, dtype=np.int64)
+    if rewards.shape != num_turns.shape:
+        raise ValueError(
+            f"rewards and num_turns must have matching shapes, got "
+            f"{rewards.shape} and {num_turns.shape}"
+        )
 
-    num_turns = np.array(num_turns)
     # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
     # Let's use this to calculate advantage.
     # mean/std should be repeated based on group lens
     group_turns = num_turns.sum(axis=-1)
-    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
-    reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
+    # Empty-trajectory placeholders are rectangular padding, not environment
+    # outcomes. They have zero turns and must not shift the normalization of
+    # valid rewards in the same group.
+    valid_rewards = num_turns > 0
+    group_means = np.zeros(rewards.shape[0], dtype=np.float64)
+    group_stds = np.zeros(rewards.shape[0], dtype=np.float64)
+    for group_idx, valid_mask in enumerate(valid_rewards):
+        if valid_mask.any():
+            valid_group_rewards = rewards[group_idx, valid_mask]
+            group_means[group_idx] = valid_group_rewards.mean()
+            group_stds[group_idx] = valid_group_rewards.std()
+    reward_means = group_means.repeat(group_turns)
+    reward_stds = group_stds.repeat(group_turns)
 
     # rewards are originally [g, group_size]
     # Making an assumption that all groups are of the same size!
@@ -2065,6 +2083,8 @@ def compute_group_stats(
     all_num_evictions = []
     all_rollout_env_ids = []
     all_problem_ids = []
+    all_rollout_statuses = []
+    all_failure_reasons = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
@@ -2081,6 +2101,8 @@ def compute_group_stats(
         group_num_evictions = []
         group_rollout_env_ids = []
         group_problem_ids = []
+        group_rollout_statuses = []
+        group_failure_reasons = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -2138,6 +2160,11 @@ def compute_group_stats(
             group_num_evictions.append(sum(rollout.num_evictions))
             group_rollout_env_ids.append(rollout.env_id)
             group_problem_ids.append(rollout.problem_id)
+            rollout_status = getattr(rollout, 'rollout_status', 'ok')
+            if not rollout.trajectory and rollout_status == 'ok':
+                rollout_status = 'placeholder'
+            group_rollout_statuses.append(rollout_status)
+            group_failure_reasons.append(getattr(rollout, 'failure_reason', None))
         all_policy_first.append(group_policy_first)
         all_policy_avg.append(group_policy_avg)
         all_policy_last.append(group_policy_last)
@@ -2148,6 +2175,8 @@ def compute_group_stats(
         all_num_evictions.append(group_num_evictions)
         all_rollout_env_ids.append(group_rollout_env_ids)
         all_problem_ids.append(group_problem_ids)
+        all_rollout_statuses.append(group_rollout_statuses)
+        all_failure_reasons.append(group_failure_reasons)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -2186,9 +2215,34 @@ def compute_group_stats(
         num_evictions=all_num_evictions,
         rollout_env_ids=all_rollout_env_ids,
         problem_ids=all_problem_ids,
+        rollout_statuses=all_rollout_statuses,
+        failure_reasons=all_failure_reasons,
     )
     return stats
 
+
+
+def _bounded_artifact_key(key, limit=100):
+    """Bound a fully-qualified metric key to wandb's artifact-name limit.
+
+    wandb backs any Table/plot value with an artifact named
+    `run-<run_id>-<sanitized key>_table` and hard-raises above 128 characters.
+    The `run-<run_id>-` prefix and `_table` suffix cost ~19 characters that the
+    caller never sees, so the key itself must stay well under 128; 100 leaves
+    margin. Sanitization only strips characters (`:`, `/`), so bounding the raw
+    key is always conservative.
+
+    Apply this to the FINAL key, after every prefix is attached. Bounding an
+    inner key before a long `env_id` is prepended does nothing -- that mistake
+    let a 128-char ValueError kill f0d3 on all three links (2026-07-26).
+
+    Truncate deterministically and append a short hash so distinct metrics keep
+    distinct keys. Short keys are returned unchanged.
+    """
+    if len(key) <= limit:
+        return key
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
 
 
 def prep_wandb_metrics(
@@ -2209,6 +2263,8 @@ def prep_wandb_metrics(
         env_ids: List[List[str]],
         problem_ids: List[List[str | None]],
         current_iteration: int,
+        rollout_statuses: List[List[str]] | None = None,
+        failure_reasons: List[List[str | None]] | None = None,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
     ):
@@ -2302,6 +2358,25 @@ def prep_wandb_metrics(
         digest = hashlib.md5(key.encode()).hexdigest()[:8]
         return f'{key[: limit - 9]}_{digest}'
 
+    def _bounded_table_key(key, limit=100):
+        """Keep a Table metric key short enough for wandb's artifact-name limit.
+
+        wandb backs a logged Table with an artifact named `run-<run_id>-<key>`
+        (special characters stripped) and hard-raises above 128 characters.
+        Long environment names blow past that -- e.g.
+        `nemo_gym:toolcall_schema_single_step_tool_use_with_argument_comparison_agent_staleness/kv_cache_...`
+        -- and because the failure happens at log time it kills the whole run
+        rather than dropping the chart. That took out two d1 chains on
+        2026-07-24 (u2d1 had never banked an iteration as a result).
+
+        Truncate deterministically and append a short hash so distinct metrics
+        keep distinct keys. Short keys are returned unchanged.
+        """
+        if len(key) <= limit:
+            return key
+        digest = hashlib.md5(key.encode()).hexdigest()[:8]
+        return f'{key[: limit - 9]}_{digest}'
+
     def _dist(prefix, values, title, native_hist=True):
         """Scalars + a Table-backed histogram chart for a 1-D list of values; also a
         native wandb.Histogram (stacks into an over-time heatmap) when native_hist.
@@ -2335,6 +2410,37 @@ def prep_wandb_metrics(
     evictions_flat = _real_flat(num_evictions)
     env_ids_flat = _real_flat(env_ids)
     problem_ids_flat = _real_flat(problem_ids)
+    statuses_grouped = rollout_statuses or [
+        ['ok'] * len(group) for group in rewards
+    ]
+    reasons_grouped = failure_reasons or [
+        [None] * len(group) for group in rewards
+    ]
+    rollout_statuses_all = _flat(statuses_grouped)
+    failure_reasons_all = _flat(reasons_grouped)
+    rollout_statuses_flat = _real_flat(statuses_grouped)
+    failure_reasons_flat = _real_flat(reasons_grouped)
+    placeholder_count = sum(
+        status == 'placeholder' or turns == 0
+        for status, turns in zip(rollout_statuses_all, _flat(num_turns))
+    )
+    masked_count = sum(status == 'masked' for status in rollout_statuses_all)
+    graded_count = sum(status == 'graded' for status in rollout_statuses_all)
+    failure_metrics.update({
+        'rollout/count': total_rollouts,
+        'rollout/placeholder_count': placeholder_count,
+        'rollout/placeholder_rate': (
+            placeholder_count / total_rollouts if total_rollouts else 0.0
+        ),
+        'rollout/masked_count': masked_count,
+        'rollout/masked_rate': (
+            masked_count / total_rollouts if total_rollouts else 0.0
+        ),
+        'rollout/graded_count': graded_count,
+        'rollout/graded_rate': (
+            graded_count / total_rollouts if total_rollouts else 0.0
+        ),
+    })
 
     # Lag = current_iteration - epoch, per real rollout, by category and source.
     policy_first = _lag(policy_first_epoch)
@@ -2344,9 +2450,16 @@ def prep_wandb_metrics(
     kv_avg = _lag(kv_avg_epoch)
     kv_last = _lag(kv_last_epoch)
 
+    valid_group_rewards = [
+        [reward for reward, turns in zip(group_rewards, group_num_turns) if turns > 0]
+        for group_rewards, group_num_turns in zip(rewards, num_turns)
+    ]
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
+        data=[
+            [np.mean(group) if group else 0.0, np.std(group) if group else 0.0]
+            for group in valid_group_rewards
+        ],
     )
 
     metrics = {
@@ -2364,13 +2477,14 @@ def prep_wandb_metrics(
         # and first/avg/last lag.
         'rollout_table': wandb_writer.Table(
             columns=[
-                'env_id', 'problem_id',
+                'env_id', 'problem_id', 'rollout_status', 'failure_reason',
                 'reward', 'traj_length', 'num_evictions',
                 'policy_first', 'policy_avg', 'policy_last',
                 'kv_cache_first', 'kv_cache_avg', 'kv_cache_last',
             ],
             data=list(zip(
                 env_ids_flat, problem_ids_flat,
+                rollout_statuses_flat, failure_reasons_flat,
                 table_rewards, traj_lens_flat, evictions_flat,
                 policy_first, policy_avg, policy_last,
                 kv_first, kv_avg, kv_last,
@@ -2389,6 +2503,9 @@ def prep_wandb_metrics(
         'max_num_turns': max(max(g) for g in num_turns_real if g),
         'min_num_turns': min(min(g) for g in num_turns_real if g),
         'mean_reward': np.mean([np.mean(g) for g in rewards]),
+        'rollout/valid_mean_reward': np.mean(
+            [reward for group in valid_group_rewards for reward in group]
+        ) if any(valid_group_rewards) else 0.0,
         'mean_advantage': np.mean(advantages),
         'nonzero_groups_ratio': np.count_nonzero(advantages) / len(advantages),
         'total_eviction_count': sum(evictions_flat),
@@ -2398,6 +2515,14 @@ def prep_wandb_metrics(
         ),
         **failure_metrics,
     }
+    for failure_reason, count in Counter(
+        reason for reason in failure_reasons_all if reason
+    ).items():
+        safe_reason = ''.join(
+            char if char.isalnum() or char in ('_', '-') else '_'
+            for char in failure_reason
+        )
+        metrics[f'rollout/failure_reason/{safe_reason}'] = count
 
     # Staleness distributions: staleness/{policy|kv_cache}/{first|avg|last}/...
     metrics.update(_dist('staleness/policy/first', policy_first, 'Policy lag (first token)'))
@@ -2477,6 +2602,12 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
             f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+            f"{env_id}_pipeline_refilled_placeholder_groups": (
+                pipeline.refilled_placeholder_groups
+            ),
+            f"{env_id}_pipeline_refilled_placeholder_batches": (
+                pipeline.refilled_placeholder_batches
+            ),
         })
         for name, samples in (
             ("infer_queue_dwell", pipeline.infer_queue_dwell),
@@ -2499,6 +2630,8 @@ def _collect_rollout_pipeline_metrics() -> dict:
         pipeline.inferred_count = 0
         pipeline.assembled_count = 0
         pipeline.yielded_count = 0
+        pipeline.refilled_placeholder_groups = 0
+        pipeline.refilled_placeholder_batches = 0
         gate.prepare_blocked_seconds = 0.0
         gate.acquire_calls = 0
         gate.release_calls = 0
@@ -2584,6 +2717,8 @@ def maybe_log_training_metrics(
     num_evictions = group_stats.num_evictions
     rollout_env_ids = group_stats.rollout_env_ids
     problem_ids = group_stats.problem_ids
+    rollout_statuses = group_stats.rollout_statuses
+    failure_reasons = group_stats.failure_reasons
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
@@ -2593,6 +2728,7 @@ def maybe_log_training_metrics(
         completed_epochs=completed_epochs,
         num_evictions=num_evictions,
         env_ids=rollout_env_ids, problem_ids=problem_ids,
+        rollout_statuses=rollout_statuses, failure_reasons=failure_reasons,
         current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
@@ -2622,12 +2758,32 @@ def maybe_log_training_metrics(
             num_evictions=env_stats(num_evictions, env_idx),
             env_ids=env_stats(rollout_env_ids, env_idx),
             problem_ids=env_stats(problem_ids, env_idx),
+            rollout_statuses=env_stats(rollout_statuses, env_idx),
+            failure_reasons=env_stats(failure_reasons, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
         )
         for k, v in env_metrics.items():
-            metrics[f"{env_id}_{k}"] = v
+            # Bound the key AFTER the env prefix, not before. _bounded_table_key
+            # inside the per-env helper only ever sees the short local prefix
+            # (e.g. 'staleness/kv_cache/first_hist'); the long env_id is
+            # prepended right here, which is what actually blows wandb's
+            # 128-char artifact-name limit. Bounding early therefore never
+            # fired: f0d3 rank 63 raised
+            #   ValueError: Artifact name is longer than 128 characters:
+            #   'run-gkjlm1s0-nemo_gymtoolcall_schema_single_step_tool_use_with
+            #    _argument_comparison_agent_stalenesskv_cachefirst_hist_table-'
+            # on all three links (2026-07-26). Because the raise happens at log
+            # time on one rank, that rank exit(1)s and KillOnBadExit tears down
+            # the other 63 -- whose crash files then all show cudaErrorContained,
+            # which reads exactly like a hardware NVLink fault and is not one.
+            # Only Table/plot-backed values become artifacts; plain scalars have
+            # no length limit, so leave those keys fully readable.
+            full_key = f"{env_id}_{k}"
+            if not isinstance(v, (int, float, bool)):
+                full_key = _bounded_artifact_key(full_key)
+            metrics[full_key] = v
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0

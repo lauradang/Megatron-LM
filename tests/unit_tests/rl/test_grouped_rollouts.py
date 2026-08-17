@@ -54,9 +54,10 @@ class MockInferenceInterface(ReturnsRaw):
 class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
     """Mock generator with configurable per-call delays."""
 
-    def __init__(self, env_id="test", **kwargs):
+    def __init__(self, env_id="test", placeholder_groups=0, **kwargs):
         super().__init__(**kwargs)
         self.env_id = env_id
+        self.placeholder_groups = placeholder_groups
         self._call_count = 0
         self.prepare_group_rollout_calls = 0
 
@@ -77,7 +78,7 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         async def build_rollout(response):
             response_idx = int(response.response.content.removeprefix("t"))
             return Rollout(
-                trajectory=[response.raw_text],
+                trajectory=[] if idx < self.placeholder_groups else [response.raw_text],
                 reward=float(response_idx),
                 env_id=self.env_id,
                 policy_epoch=[response.policy_epoch],
@@ -257,6 +258,68 @@ class TestGroupedRollouts:
         with pytest.raises(AssertionError, match="filter_groups_with_same_reward"):
             async for _ in gen.get_grouped_rollouts(request):
                 pass
+
+    @pytest.mark.asyncio
+    async def test_streaming_group_consumption_refills_placeholder_groups(self):
+        gen = MockGenerator(parallel_generation_tasks=2, placeholder_groups=2)
+        request = GroupedRolloutRequest(
+            num_groups=1,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="G",
+            consumption_granularity="G",
+        )
+        it = gen.get_grouped_rollouts(request)
+        try:
+            group = await asyncio.wait_for(anext(it), timeout=10)
+            assert group[0].trajectory == ["t2"]
+            assert gen._active_pipeline.refilled_placeholder_groups == 2
+            assert gen._active_pipeline.gate.release_calls == 2
+        finally:
+            await it.aclose()
+
+    @pytest.mark.asyncio
+    async def test_batch_consumption_refills_placeholder_batch(self):
+        gen = MockGenerator(parallel_generation_tasks=1, placeholder_groups=1)
+        request = GroupedRolloutRequest(
+            num_groups=1,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        it = gen.get_grouped_rollouts(request)
+        try:
+            group = await asyncio.wait_for(anext(it), timeout=10)
+            assert group[0].trajectory == ["t1"]
+            assert gen._active_pipeline.refilled_placeholder_groups == 0
+            assert gen._active_pipeline.refilled_placeholder_batches == 1
+            assert gen._active_pipeline.gate.release_calls == 1
+        finally:
+            await it.aclose()
+
+    @pytest.mark.asyncio
+    async def test_batch_consumption_keeps_partially_valid_batch(self):
+        gen = MockGenerator(parallel_generation_tasks=1, placeholder_groups=1)
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        it = gen.get_grouped_rollouts(request)
+        try:
+            first = await asyncio.wait_for(anext(it), timeout=10)
+            second = await asyncio.wait_for(anext(it), timeout=10)
+            assert first[0].trajectory == []
+            assert second[0].trajectory == ["t1"]
+            assert gen._active_pipeline.refilled_placeholder_batches == 0
+        finally:
+            await it.aclose()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
