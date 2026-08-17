@@ -605,6 +605,13 @@ def _weighted_agent(env_weights):
 class TestRestoreBalancing:
     """Cap-and-defer injection + per-env residual balancing for restored groups."""
 
+    def test_env_ids_rejects_mismatched_agents_and_configs(self):
+        agent = _weighted_agent([("a", 1.0), ("b", 1.0)])
+        agent.agent_configs.pop()
+
+        with pytest.raises(ValueError, match=r"zip\(\) argument 2 is shorter"):
+            agent._env_ids()
+
     def test_env_targets_matches_distribute_counts(self):
         agent = _weighted_agent([("a", 1.0), ("b", 1.0), ("c", 1.0)])
         for n in (3, 6, 7, 10):

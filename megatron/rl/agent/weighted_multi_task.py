@@ -200,7 +200,7 @@ class WeightedMultiTask(
     def _env_ids(self) -> list[str]:
         """Per-agent env_ids"""
         env_ids = []
-        for i, (a, config) in enumerate(zip(self.agents, self.agent_configs)):
+        for i, (a, config) in enumerate(zip(self.agents, self.agent_configs, strict=True)):
             env_id = getattr(a, "env_id", None)
             if not env_id and not config.evaluation_only:
                 raise ValueError(
