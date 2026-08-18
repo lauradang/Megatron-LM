@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from collections import deque
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -15,6 +16,7 @@ from megatron.rl.agent.api import (
     RolloutGenerator,
     RolloutGroup,
     RolloutRequest,
+    TokenRollout,
     _SubmissionGate,
 )
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
@@ -90,11 +92,19 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
 
 
 def test_grouped_rollout_generator_initializes_rollout_bank():
-    assert MockGenerator()._rollout_bank is None
+    generator = MockGenerator()
+    assert generator._rollout_bank is None
+    assert generator._restored_groups is None
 
 
 def test_rollout_group_defines_optional_uid():
     assert RolloutGroup.model_fields["uid"].default is None
+
+
+def test_rollout_types_preserve_upstream_metadata_fields():
+    assert Rollout.model_fields["rollout_status"].default == "ok"
+    assert Rollout.model_fields["failure_reason"].default is None
+    assert TokenRollout.model_fields["completion_ids"].default == []
 
 
 class CountingRewardAgent(RewardOnlyAgent):
@@ -404,6 +414,63 @@ class TestGroupedRollouts:
             assert trajectories[: len(expected_trajectories)] == expected_trajectories
 
     @pytest.mark.asyncio
+    async def test_batch_order_starts_at_initial_batch_id(self):
+        gen = MockGenerator(parallel_generation_tasks=1)
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+            initial_batch_id=10,
+        )
+
+        groups = []
+        async for group in gen.get_grouped_rollouts(request):
+            groups.append(group)
+            if len(groups) == 4:
+                break
+
+        assert [group.batch_id for group in groups] == [10, 10, 11, 11]
+        assert [group.index_in_batch for group in groups] == [0, 1, 0, 1]
+
+    @pytest.mark.asyncio
+    async def test_restored_group_replaces_fresh_work_with_current_batch_metadata(self):
+        gen = MockGenerator(parallel_generation_tasks=1)
+        restored = RolloutGroup(
+            rollouts=[
+                Rollout(
+                    trajectory=["cached"],
+                    reward=1.0,
+                    env_id="test",
+                    policy_epoch=[[(0, 0)]],
+                    kv_cache_epoch=[[(0, 0)]],
+                    num_evictions=[0],
+                )
+            ],
+            batch_id=99,
+            index_in_batch=99,
+        )
+        gen._restored_groups = deque([restored])
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+            initial_batch_id=10,
+        )
+
+        groups = [group async for group in gen.get_grouped_rollouts(request)]
+
+        assert [group.batch_id for group in groups] == [10, 10]
+        assert [group.index_in_batch for group in groups] == [0, 1]
+        assert groups[0][0].trajectory == ["cached"]
+        assert gen.prepare_group_rollout_calls == 1
+        assert gen._active_pipeline is None
+
+    @pytest.mark.asyncio
     async def test_rollout_submission_granularity_limits_inference_concurrency(self):
         gen = MockGenerator(parallel_generation_tasks=2)
         inference_interface = MockInferenceInterface(num_slow_calls=100)
@@ -475,6 +542,7 @@ class TestGroupedRollouts:
             assert sub_req.streaming == request.streaming
             assert sub_req.submission_granularity == request.submission_granularity
             assert sub_req.consumption_granularity == request.consumption_granularity
+            assert sub_req.initial_batch_id == request.initial_batch_id
         assert [agent.parallel_generation_tasks for agent in mt.agents] == (
             expected_parallel_generation_tasks
         )

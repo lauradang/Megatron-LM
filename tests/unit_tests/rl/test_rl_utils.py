@@ -235,6 +235,8 @@ class TestRLUtils:
             return Agent()
 
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", None)
         monkeypatch.setattr(rl_utils, "get_agent", get_agent)
 
         args = SimpleNamespace(
@@ -249,6 +251,7 @@ class TestRLUtils:
             rl_default_top_p=1.0,
             rl_default_top_k=0,
             grpo_filter_groups_with_same_reward=False,
+            curr_iteration=17,
         )
 
         result = rl_utils.get_rollout_generator(
@@ -259,6 +262,7 @@ class TestRLUtils:
         assert captured["request"].num_groups == n_prompts
         assert captured["request"].streaming == rl_partial_rollouts
         assert captured["request"].submission_granularity == submission_granularity
+        assert captured["request"].initial_batch_id == 17
 
     @pytest.mark.parametrize(
         "overrides, match",

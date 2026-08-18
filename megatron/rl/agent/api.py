@@ -54,6 +54,7 @@ class GroupedRolloutRequest(Request):
     streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
+    initial_batch_id: int = 0
 
 
 class GroupRolloutParams(NamedTuple):
@@ -263,6 +264,7 @@ class _RolloutPipeline:
         # Optional durable rollout bank. Injected (never read from a global) so the
         # pipeline stays testable; when None, all bank calls are skipped.
         self.bank = bank
+        self.initial_batch_id = request.initial_batch_id
         self.gran_policy = _GranularityConfig.from_request(request)
         self.gate = _SubmissionGate(
             capacity=parallel_generation_tasks,
@@ -302,6 +304,7 @@ class _RolloutPipeline:
         self.prepared_count = 0
         self.inferred_count = 0
         self.assembled_count = 0
+        self.restored_count = 0
         self.yielded_count = 0
         self.refilled_placeholder_groups = 0
         self.refilled_placeholder_batches = 0
@@ -316,10 +319,20 @@ class _RolloutPipeline:
         try:
             while self.request.streaming or group_id < self.request.num_groups:
                 await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
+                batch_id = self.initial_batch_id + group_id // self.gran_policy.num_groups_per_batch
 
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
+                    restored = self.agent.take_restored_group()
+                    if restored is not None:
+                        restored.batch_id = batch_id
+                        restored.index_in_batch = index_in_batch
+                        self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
+                        add_inflight(len(restored))
+                        await self.output_queue.put(restored)
+                        self.restored_count += 1
+                        group_id += 1
+                        continue
                     params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
 
                     # This group's rollouts now enter flight (generation starting).
@@ -474,7 +487,7 @@ class _RolloutPipeline:
                 yield group
                 self.gate.release_for("G")
 
-        next_batch_id = 0
+        next_batch_id = self.initial_batch_id
         pending = self._consume_pending
         while True:
             try:
@@ -521,8 +534,13 @@ class GroupedRolloutGenerator(Agent, ABC):
     def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self._rollout_bank = None
+        self._restored_groups = None
         if parallel_generation_tasks is not None:
             self.parallel_generation_tasks = parallel_generation_tasks
+
+    def take_restored_group(self) -> RolloutGroup | None:
+        """Return the next recovered group assigned to this producer, if available."""
+        return self._restored_groups.popleft() if self._restored_groups else None
 
     @abstractmethod
     async def prepare_group_rollout(

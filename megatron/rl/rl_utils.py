@@ -850,6 +850,7 @@ def get_rollout_generator(
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
             submission_granularity=args.rl_submission_granularity,
             consumption_granularity=args.rl_consumption_granularity,
+            initial_batch_id=args.curr_iteration,
         )
         base_gen = agent.get_grouped_rollouts(request)
 
@@ -2440,6 +2441,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
             f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
+            f"{env_id}_pipeline_restored_count": pipeline.restored_count,
             f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
             f"{env_id}_pipeline_refilled_placeholder_groups": (
                 pipeline.refilled_placeholder_groups
@@ -2468,6 +2470,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
         pipeline.prepared_count = 0
         pipeline.inferred_count = 0
         pipeline.assembled_count = 0
+        pipeline.restored_count = 0
         pipeline.yielded_count = 0
         pipeline.refilled_placeholder_groups = 0
         pipeline.refilled_placeholder_batches = 0

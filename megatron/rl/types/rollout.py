@@ -9,6 +9,9 @@ from pydantic import BaseModel
 #: (see ``WeightedMultiTask._env_ids``).
 EnvId: TypeAlias = str
 
+KNOWN_ROLLOUT_STATUSES = ('ok', 'placeholder', 'masked', 'graded')
+
+
 class AgentBaseModel(BaseModel, extra='allow'):
     """Base model for agent data types."""
 
@@ -21,6 +24,8 @@ class Rollout(AgentBaseModel):
     reward: float | None = None
     env_id: str = ''
     problem_id: str | None = None
+    rollout_status: str = 'ok'
+    failure_reason: str | None = None
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
@@ -35,6 +40,7 @@ class TokenRollout(AgentBaseModel):
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
+    completion_ids: list[str] = []
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]

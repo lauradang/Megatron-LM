@@ -8,8 +8,7 @@ from typing import Any, Optional, Type
 import numpy as np
 
 from .. import import_class
-from ..inflight_tracker import add_inflight
-from ..types import GroupedRollouts, GroupQueuesPerEnv, RolloutGroup
+from ..types import GroupedRollouts, GroupQueuesPerEnv
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -235,21 +234,6 @@ class WeightedMultiTask(
         self._restored_groups = restored
         return sum(len(queue) for queue in restored.values())
 
-    @staticmethod
-    async def _restored_then_fresh(
-        restored: deque[RolloutGroup] | None, restored_count: int, fresh_generator
-    ):
-        """Yield the reserved restored groups before engaging fresh generation."""
-        for _ in range(restored_count):
-            if not restored:
-                break
-            group = restored.popleft()
-            add_inflight(len(group))
-            yield group
-        if fresh_generator is not None:
-            async for group in fresh_generator:
-                yield group
-
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
@@ -346,9 +330,6 @@ class WeightedMultiTask(
 
         # Create tasks for each agent with non-zero groups
         generators = []
-        restored_remaining = {
-            env_id: len(queue) for env_id, queue in (self._restored_groups or {}).items()
-        }
         for agent, env_id, num_groups, pgt in zip(
             self.agents, env_ids, agent_groups, agent_pgts, strict=True
         ):
@@ -357,31 +338,22 @@ class WeightedMultiTask(
                     raise TypeError(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
-                available = restored_remaining.get(env_id, 0)
-                restored_count = available if request.streaming else min(num_groups, available)
-                restored_remaining[env_id] = available - restored_count
-                fresh_groups = num_groups if request.streaming else num_groups - restored_count
-                fresh_generator = None
-                if fresh_groups > 0:
-                    agent.parallel_generation_tasks = pgt
-                    agent._rollout_bank = self._rollout_bank
-                    agent_request = GroupedRolloutRequest(
-                        num_groups=fresh_groups,
-                        streaming=request.streaming,
-                        rollouts_per_group=request.rollouts_per_group,
-                        inference_interface=request.inference_interface,
-                        validation=request.validation,
-                        generation_args=request.generation_args,
-                        filter_groups_with_same_reward=request.filter_groups_with_same_reward,
-                        submission_granularity=request.submission_granularity,
-                        consumption_granularity=request.consumption_granularity,
-                    )
-                    fresh_generator = agent.get_grouped_rollouts(agent_request)
-                generators.append(
-                    self._restored_then_fresh(
-                        (self._restored_groups or {}).get(env_id), restored_count, fresh_generator
-                    )
+                agent.parallel_generation_tasks = pgt
+                agent._rollout_bank = self._rollout_bank
+                agent._restored_groups = (self._restored_groups or {}).get(env_id)
+                agent_request = GroupedRolloutRequest(
+                    num_groups=num_groups,
+                    streaming=request.streaming,
+                    rollouts_per_group=request.rollouts_per_group,
+                    inference_interface=request.inference_interface,
+                    validation=request.validation,
+                    generation_args=request.generation_args,
+                    filter_groups_with_same_reward=request.filter_groups_with_same_reward,
+                    submission_granularity=request.submission_granularity,
+                    consumption_granularity=request.consumption_granularity,
+                    initial_batch_id=request.initial_batch_id,
                 )
+                generators.append(agent.get_grouped_rollouts(agent_request))
             else:
                 generators.append(None)
 
