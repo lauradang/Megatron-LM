@@ -4,6 +4,7 @@
 
 import asyncio
 import time
+import uuid
 from collections import deque
 from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
 
@@ -309,9 +310,30 @@ class RolloutPipeline:
         env_index = self.gran_policy.env_of_index(index_in_batch)
         agent = self.allocations[env_index].agent
         params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
+        # Give every bank-backed occurrence an identity before any member can
+        # enter a partial snapshot. The completed record carries the same ID.
+        if self.bank is not None and params.partial_uid is None:
+            params = params._replace(partial_uid=uuid.uuid4().hex)
+        resume = params.resume_members or {}
         self.prepared_groups_per_env[env_index] += 1
 
+        if resume:
+            bucket = self._assemble_pending.setdefault(group_id, [])
+            for rollout_idx, episode in resume.items():
+                item = _InferWorkItem(
+                    group_id=group_id,
+                    rollout_idx=rollout_idx,
+                    batch_id=batch_id,
+                    index_in_batch=index_in_batch,
+                    params=params,
+                    env_index=env_index,
+                )
+                bucket.append(_InferredItem(item=item, episode=episode))
+            self.prepared_count += len(resume)
+
         for rollout_idx in range(self.request.rollouts_per_group):
+            if rollout_idx in resume:
+                continue
             await self.gate.acquire_for("R")
             item = _InferWorkItem(
                 group_id=group_id,
@@ -469,7 +491,9 @@ class RolloutPipeline:
                     task.add_done_callback(self._regen_tasks.discard)
                     continue
                 if self.bank is not None:
-                    group.uid = self.bank.append(group)
+                    group.uid = self.bank.append(
+                        group, partial_uid=first.item.params.partial_uid
+                    )
                 self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
                     time.monotonic()
                 )

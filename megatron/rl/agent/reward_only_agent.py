@@ -2,9 +2,11 @@
 
 import asyncio
 import functools
+import logging
 from typing import Any
 
 import numpy as np
+from pydantic import PrivateAttr
 from tqdm.asyncio import tqdm
 
 from ..inference import (
@@ -14,6 +16,7 @@ from ..inference import (
     ReturnsRaw,
     ReturnsTokens,
 )
+from ..types import PartialsByProblemId
 from .api import (
     EpisodeResult,
     EvaluationAgent,
@@ -30,6 +33,8 @@ from .api import (
 )
 from .pass_at_evaluation_agent import PassAtEvaluationAgent
 
+logger = logging.getLogger(__name__)
+
 
 class RewardOnlyEvaluationResponse(EvaluationResponse[RewardEvaluationResult]):
     type_name: str = 'RewardOnlyEvaluationResponse'
@@ -43,6 +48,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
     env_id: str | None = None
     max_turns: int = 1
+    _resume_partials: PartialsByProblemId | None = PrivateAttr(default=None)
 
     def get_dataset(self, validation: bool = False):
         """Return validation or train dataset."""
@@ -239,10 +245,90 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         prompt, golden = await self.get_prompt(validation=request.validation)
 
+        inference_request = request.inference_interface.prepare_request(
+            prompt, request.generation_args
+        )
+        resume_members: dict[int, EpisodeResult] | None = None
+        partial_uid: str | None = None
+        problem_id = golden.get("problem_id") if isinstance(golden, dict) else None
+        if self._resume_partials and problem_id is not None:
+            snapshots = self._resume_partials.get(problem_id)
+            snapshot = snapshots.pop(0) if snapshots else None
+            if snapshots == []:
+                del self._resume_partials[problem_id]
+            if snapshot is not None:
+                # Keep the occurrence ID even when incompatible members must be
+                # regenerated, so completion invalidates the stale snapshot.
+                partial_uid = snapshot.get("partial_uid")
+                members = snapshot.get("finished_members")
+                indices = (
+                    [member.get("rollout_idx") for member in members]
+                    if isinstance(members, list)
+                    else []
+                )
+                valid = (
+                    snapshot.get("rollouts_per_group") == request.rollouts_per_group
+                    and 0 < len(indices) < request.rollouts_per_group
+                    and all(
+                        isinstance(index, int)
+                        and not isinstance(index, bool)
+                        and 0 <= index < request.rollouts_per_group
+                        for index in indices
+                    )
+                    and len(set(indices)) == len(indices)
+                )
+                if valid:
+                    try:
+                        resume_members = {
+                            member["rollout_idx"]: self._restore_partial_episode(
+                                member, snapshot
+                            )
+                            for member in members
+                        }
+                    except (KeyError, TypeError, ValueError):
+                        valid = False
+                        resume_members = None
+                if not valid:
+                    logger.warning(
+                        "Discarding incompatible partial snapshot for %s: "
+                        "saved rollouts_per_group=%r, current=%d, member indices=%r",
+                        problem_id,
+                        snapshot.get("rollouts_per_group"),
+                        request.rollouts_per_group,
+                        indices,
+                    )
+
         # Every rollout runs as a (possibly multi-turn) episode over the group's shared prompt.
         return GroupRolloutParams(
             run_episode=functools.partial(self._run_episode, request, prompt=prompt, golden=golden),
             build_rollout=functools.partial(self._rollout_from_episode, request, golden=golden),
+            golden=golden,
+            inference_request=inference_request,
+            resume_members=resume_members,
+            partial_uid=partial_uid,
+        )
+
+    @staticmethod
+    def _restore_partial_episode(member: dict, snapshot: dict) -> EpisodeResult:
+        """Decode a current episode snapshot or a legacy single-response snapshot."""
+        if "episode" in member:
+            episode = member["episode"]
+            return EpisodeResult(
+                responses=[
+                    InferenceResponse.model_validate(response)
+                    for response in episode["responses"]
+                ],
+                conversation=[
+                    LLMChatMessage.model_validate(message)
+                    for message in episode["conversation"]
+                ],
+            )
+
+        response = InferenceResponse.model_validate(member["response"])
+        saved_request = InferenceRequest.model_validate(snapshot["inference_request"])
+        return EpisodeResult(
+            responses=[response],
+            conversation=[*saved_request.prompt, response.response],
         )
 
     async def _evaluation(

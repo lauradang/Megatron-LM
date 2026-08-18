@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
+from typing import Any, Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 from ..__init__ import Request, TypeLookupable
 from ..inference import InferenceInterface, InferenceRequest, InferenceResponse, LLMChatMessage
@@ -46,6 +46,10 @@ class GroupRolloutParams(NamedTuple):
 
     run_episode: Callable[[], Awaitable[EpisodeResult]]
     build_rollout: Callable[[EpisodeResult], Awaitable[Rollout]]
+    golden: Any = None
+    inference_request: InferenceRequest | None = None
+    resume_members: dict[int, EpisodeResult] | None = None
+    partial_uid: str | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):

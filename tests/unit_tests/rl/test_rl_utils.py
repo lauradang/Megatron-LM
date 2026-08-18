@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -157,6 +158,33 @@ class DummyMoELayer:
     def transition_cudagraph_scope(self, mode):
         self.transition_calls.append(mode)
         self.use_partial_cudagraphs = mode == "partial"
+
+
+def test_collect_nemogym_resume_metrics(tmp_path, monkeypatch):
+    episodes_dir = tmp_path / "episodes" / "ab"
+    episodes_dir.mkdir(parents=True)
+    checkpoints = [
+        {"status": "completed", "resume_count": 0, "restart_count": 0},
+        {"status": "completed", "resume_count": 2, "restart_count": 0},
+        {"status": "in_progress", "resume_count": 1, "restart_count": 3},
+    ]
+    for index, checkpoint in enumerate(checkpoints):
+        (episodes_dir / f"{index}.json").write_text(json.dumps(checkpoint))
+    (episodes_dir / "invalid.json").write_text("not json")
+    monkeypatch.setenv("NEMOGYM_EPISODE_CHECKPOINT_DIR", str(tmp_path))
+
+    assert rl_utils._collect_nemogym_resume_metrics() == {
+        "nemogym_resume/checkpoint_count": 3,
+        "nemogym_resume/in_progress_count": 1,
+        "nemogym_resume/completed_count": 2,
+        "nemogym_resume/resumed_episode_count": 2,
+        "nemogym_resume/completed_resumed_episode_count": 1,
+        "nemogym_resume/resume_event_count": 3,
+        "nemogym_resume/max_resume_count": 2,
+        "nemogym_resume/restarted_episode_count": 1,
+        "nemogym_resume/restart_event_count": 3,
+        "nemogym_resume/invalid_checkpoint_count": 1,
+    }
 
 
 @pytest.fixture

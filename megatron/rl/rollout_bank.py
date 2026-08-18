@@ -6,8 +6,9 @@ Persists completed ``RolloutGroup``s the instant they assemble, so a SIGKILL (th
 4h SLURM limit) does not destroy work that is already on disk. This is PR #1 of
 the durable rollout bank: it covers only the *queued* path — groups sitting in
 the pipeline's ``output_queue`` (assembled, not yet trained-in) plus groups
-consumed at a training step that a restart rolls back. In-flight decode state and
-partial-group snapshots (design phases B/C) are out of scope here.
+consumed at a training step that a restart rolls back. In-flight decode-engine
+state (design phase C) remains out of scope; partial-group snapshots are
+persisted separately at the bank root.
 
 Layout (single-writer, rank-0 only, on Lustre)::
 
@@ -60,7 +61,7 @@ from typing import Iterable, Iterator, Literal, NamedTuple, NotRequired, Optiona
 
 import numpy as np
 
-from megatron.rl.types import Rollout, RolloutGroup, TokenRollout
+from megatron.rl.types import PartialGroupSnapshot, Rollout, RolloutGroup, TokenRollout
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ _CONSUMED = "consumed.log"
 _TOKENS_BIN = "tokens.bin"
 _LOGPROBS_BIN = "logprobs.bin"
 _MASKS_BIN = "masks.bin"
+_INFLIGHT = "inflight.json"
 
 
 class SidecarMeta(TypedDict):
@@ -125,6 +127,7 @@ class LedgerRecord(TypedDict):
     tok: NotRequired[SidecarMeta]
     lp: NotRequired[SidecarMeta]
     mask: NotRequired[SidecarMeta]
+    partial_uid: NotRequired[str]
     checksum: NotRequired[str]
 
 
@@ -259,6 +262,10 @@ class RolloutBank:
     @property
     def _generations_dir(self) -> str:
         return os.path.join(self.bank_dir, _GENERATIONS)
+
+    @property
+    def _inflight_path(self) -> str:
+        return os.path.join(self.bank_dir, _INFLIGHT)
 
     def _generation_dir(self, manifest: Manifest) -> str:
         return os.path.join(self._generations_dir, manifest["active_generation"])
@@ -437,11 +444,17 @@ class RolloutBank:
             self._close_handles()
 
     # ---------------------------------------------------------------- append
-    def append(self, group: "RolloutGroup", uid: str | None = None) -> str:
+    def append(
+        self,
+        group: "RolloutGroup",
+        uid: str | None = None,
+        partial_uid: str | None = None,
+    ) -> str:
         """Write-through one completed group; return its stable uid.
 
         A uid is assigned for a new group or preserved when rewriting an
-        existing group during compaction.
+        existing group during compaction. ``partial_uid`` identifies the live
+        occurrence so a completed record invalidates its stale snapshot.
         """
         with self._lock:
             assert self._seg_dir is not None, "set_collection() must be called before append()"
@@ -455,6 +468,8 @@ class RolloutBank:
                     self._seq = max(self._seq, int(uid_seq) + 1)
 
             record, tok_bytes, lp_bytes, mask_bytes = self._encode(group, uid)
+            if partial_uid is not None:
+                record["partial_uid"] = partial_uid
             # Write sidecar slices first, then the index record that points at them,
             # so a torn write can only ever lose the trailing index line.
             if tok_bytes:
@@ -642,6 +657,83 @@ class RolloutBank:
             restored, _ = self._restore_state(trained_through)
             return restored
 
+    def snapshot_partial(
+        self, partials: list[PartialGroupSnapshot], collection_iter: int
+    ) -> None:
+        """Atomically replace the finished-member snapshot for this window.
+
+        Args:
+            partials: Partial groups still live at the quiescent boundary.
+            collection_iter: Collection iteration represented by the snapshot.
+        """
+        with self._lock:
+            payload = {
+                "format_version": _FORMAT_VERSION,
+                "collection_iter": collection_iter,
+                "partials": partials,
+            }
+            payload["checksum"] = _checksum(payload)
+            tmp = self._inflight_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._inflight_path)
+            _fsync_directory(self.bank_dir)
+
+    def restore_partial(self, trained_through: int) -> list[PartialGroupSnapshot]:
+        """Return snapshots not superseded by completed ledger records.
+
+        Args:
+            trained_through: Loaded checkpoint iteration. Occurrence IDs, rather
+                than iteration numbers, provide partial-snapshot deduplication.
+
+        Returns:
+            Valid partial snapshots that still need to be completed.
+        """
+        del trained_through
+        with self._lock:
+            payload = self._read_inflight()
+            if payload is None:
+                return []
+            completed = self._completed_partial_uids()
+            return [
+                partial
+                for partial in payload.get("partials", [])
+                if partial.get("partial_uid") not in completed
+            ]
+
+    def _read_inflight(self) -> Optional[dict]:
+        """Read and validate the inflight snapshot, or fail safe to no partials."""
+        if not os.path.exists(self._inflight_path):
+            return None
+        try:
+            with open(self._inflight_path) as f:
+                payload = json.load(f)
+            _validate_format_version(payload, self._inflight_path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            logger.warning(
+                "Dropping unreadable/incompatible inflight snapshot at %s",
+                self._inflight_path,
+            )
+            return None
+        expected = _checksum({key: value for key, value in payload.items() if key != "checksum"})
+        if expected != payload.get("checksum"):
+            logger.warning("Inflight snapshot checksum mismatch at %s; dropping", self._inflight_path)
+            return None
+        return payload
+
+    def _completed_partial_uids(self) -> set[str]:
+        """Return occurrence IDs recorded in the active generation."""
+        manifest = self._read_manifest()
+        generation_dir = self._generation_dir(manifest)
+        completed: set[str] = set()
+        for segment in manifest["segments"]:
+            for record in self._read_ledger(os.path.join(generation_dir, segment)):
+                if partial_uid := record.get("partial_uid"):
+                    completed.add(partial_uid)
+        return completed
+
     def _restore_state(self, trained_through: int) -> tuple[list["RolloutGroup"], dict[str, int]]:
         """Return survivors and the active generation's collapsed markers."""
         self._close_handles()  # flush any active writer before reading
@@ -769,6 +861,7 @@ class RolloutBank:
                 index_in_batch=group_dict.get("index_in_batch", 0),
             )
             group.uid = uid
+            group.partial_uid = record.get("partial_uid")
             return group
 
         # token kind: re-split flat sidecar arrays back into jagged per-turn lists
@@ -800,6 +893,7 @@ class RolloutBank:
             index_in_batch=group_dict.get("index_in_batch", 0),
         )
         group.uid = uid
+        group.partial_uid = record.get("partial_uid")
         return group
 
     @staticmethod
@@ -947,7 +1041,11 @@ class RolloutBank:
         self._warned_over_cap = True  # staging data is not live yet
         try:
             for group in groups:
-                self.append(group, uid=group.uid)  # reuses the write-through encoder + fsync
+                self.append(
+                    group,
+                    uid=group.uid,
+                    partial_uid=getattr(group, "partial_uid", None),
+                )
         finally:
             self._close_handles()
             self._bytes_written = live_bytes

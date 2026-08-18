@@ -105,7 +105,12 @@ from megatron.rl.sequence_packing_utils import (
     update_microbatch_calculator,
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
-from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
+from megatron.rl.types import (
+    KNOWN_ROLLOUT_STATUSES,
+    PartialGroupSnapshot,
+    PartialMember,
+    RestoredPartialsByAgent,
+)
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
@@ -359,6 +364,7 @@ class RLRuntimeState:
         # Durable rollout-bank state (rank 0 only). Recovered groups live on the
         # rollout agent, which treats them as per-environment producers.
         self.rollout_bank = None
+        self.restored_partials: RestoredPartialsByAgent = {}
         self.bank_restored = False
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
         # Per-GPU variants are available via methods that divide by world_size.
@@ -813,8 +819,15 @@ def get_environment_rollouts(
             if bank is not None:
                 agent = _get_or_create_rollout_agent(args.langrl_env_config)
                 if not runtime_state.bank_restored:
+                    # Read before recover() compacts away completed IDs that must
+                    # still suppress stale snapshots.
+                    restored_partials = bank.restore_partial(args.iteration)
                     restored_groups: GroupedRollouts = bank.recover(args.iteration)
                     total_restored_groups = agent.set_restored_groups(restored_groups)
+                    runtime_state.restored_partials = _index_partials_by_env(
+                        restored_partials
+                    )
+                    _install_restored_partials(agent, runtime_state.restored_partials)
                     runtime_state.bank_restored = True
                     if total_restored_groups:
                         log_single_rank(
@@ -857,6 +870,8 @@ def get_environment_rollouts(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    if bank is not None and args.rl_partial_rollouts:
+                        _snapshot_partial_groups(bank, args.curr_iteration)
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
@@ -1721,6 +1736,154 @@ def prep_wandb_metrics(
     return metrics
 
 
+def _rollout_sub_agents(agent):
+    """Return sub-agents in the stable order used by partial snapshots."""
+    return agent.agents if isinstance(agent, WeightedMultiTask) else [agent]
+
+
+def _index_partials_by_env(
+    partials: list[PartialGroupSnapshot],
+) -> RestoredPartialsByAgent:
+    """Index snapshots by agent and problem without collapsing occurrences."""
+    indexed: RestoredPartialsByAgent = {}
+    for partial in partials:
+        agent_key = (partial["env_id"], partial.get("agent_index", 0))
+        by_problem = indexed.setdefault(agent_key, {})
+        by_problem.setdefault(partial["problem_id"], []).append(partial)
+    return indexed
+
+
+def _install_restored_partials(agent, restored: RestoredPartialsByAgent) -> None:
+    """Attach each agent's recovered snapshots for dataset-row re-service."""
+    for agent_index, sub_agent in enumerate(_rollout_sub_agents(agent)):
+        env_id = getattr(sub_agent, "env_id", "") or "rollout"
+        sub_agent._resume_partials = restored.get((env_id, agent_index), {})
+
+
+def _snapshot_partial_groups(bank, collection_iter: int) -> None:
+    """Persist finished members from live partial groups at a quiescent window."""
+    if _ROLLOUT_AGENT is None:
+        return
+
+    sub_agents = _rollout_sub_agents(_ROLLOUT_AGENT)
+    agent_indices = {id(agent): index for index, agent in enumerate(sub_agents)}
+    partials_by_uid: dict[str, PartialGroupSnapshot] = {}
+
+    # Carry unclaimed restored occurrences through another preemption.
+    for sub_agent in sub_agents:
+        for snapshots in (getattr(sub_agent, "_resume_partials", None) or {}).values():
+            for snapshot in snapshots:
+                partials_by_uid[snapshot["partial_uid"]] = snapshot
+
+    pipeline = _ROLLOUT_PIPELINE
+    if pipeline is not None:
+        for bucket in pipeline._assemble_pending.values():
+            if not bucket:
+                continue
+            first = bucket[0]
+            params = first.item.params
+            golden = params.golden
+            problem_id = golden.get("problem_id") if isinstance(golden, dict) else None
+            if problem_id is None or params.inference_request is None or params.partial_uid is None:
+                continue
+            allocation = pipeline.allocations[first.item.env_index]
+            agent_index = agent_indices[id(allocation.agent)]
+            try:
+                request_dump = params.inference_request.model_dump()
+                finished_members: list[PartialMember] = [
+                    {
+                        "rollout_idx": inferred.item.rollout_idx,
+                        "episode": {
+                            "responses": [
+                                response.model_dump() for response in inferred.episode.responses
+                            ],
+                            "conversation": [
+                                message.model_dump() for message in inferred.episode.conversation
+                            ],
+                        },
+                    }
+                    for inferred in bucket
+                ]
+                json.dumps(
+                    {"request": request_dump, "golden": golden, "members": finished_members}
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping partial snapshot for %s: unserializable request, golden, or episode",
+                    problem_id,
+                )
+                continue
+
+            partial = PartialGroupSnapshot(
+                partial_uid=params.partial_uid,
+                env_id=allocation.env_id or "rollout",
+                agent_index=agent_index,
+                problem_id=problem_id,
+                inference_request=request_dump,
+                golden=golden,
+                rollouts_per_group=pipeline.request.rollouts_per_group,
+                batch_id=first.item.batch_id,
+                index_in_batch=first.item.index_in_batch,
+                finished_members=finished_members,
+            )
+            partials_by_uid[partial["partial_uid"]] = partial
+
+    bank.snapshot_partial(list(partials_by_uid.values()), collection_iter)
+
+
+def _collect_nemogym_resume_metrics() -> dict:
+    """Summarize durable NeMo Gym episode checkpoints for W&B."""
+    checkpoint_root = os.environ.get("NEMOGYM_EPISODE_CHECKPOINT_DIR")
+    if not checkpoint_root:
+        return {}
+
+    episodes_dir = Path(checkpoint_root) / "episodes"
+    checkpoints = []
+    invalid_count = 0
+    if episodes_dir.is_dir():
+        for checkpoint_path in episodes_dir.rglob("*.json"):
+            try:
+                checkpoints.append(json.loads(checkpoint_path.read_text()))
+            except (OSError, json.JSONDecodeError):
+                invalid_count += 1
+                logger.warning(
+                    "Could not read NeMo Gym episode checkpoint %s",
+                    checkpoint_path,
+                    exc_info=True,
+                )
+
+    resume_counts = [int(checkpoint.get("resume_count", 0)) for checkpoint in checkpoints]
+    restart_counts = [int(checkpoint.get("restart_count", 0)) for checkpoint in checkpoints]
+    completed = [checkpoint for checkpoint in checkpoints if checkpoint.get("status") == "completed"]
+    metrics = {
+        "nemogym_resume/checkpoint_count": len(checkpoints),
+        "nemogym_resume/in_progress_count": sum(
+            checkpoint.get("status") == "in_progress" for checkpoint in checkpoints
+        ),
+        "nemogym_resume/completed_count": len(completed),
+        "nemogym_resume/resumed_episode_count": sum(count > 0 for count in resume_counts),
+        "nemogym_resume/completed_resumed_episode_count": sum(
+            int(checkpoint.get("resume_count", 0)) > 0 for checkpoint in completed
+        ),
+        "nemogym_resume/resume_event_count": sum(resume_counts),
+        "nemogym_resume/max_resume_count": max(resume_counts, default=0),
+        "nemogym_resume/restarted_episode_count": sum(count > 0 for count in restart_counts),
+        "nemogym_resume/restart_event_count": sum(restart_counts),
+        "nemogym_resume/invalid_checkpoint_count": invalid_count,
+    }
+    logger.info(
+        "NeMo Gym resume metrics: checkpoints=%d completed=%d in_progress=%d "
+        "resumed_episodes=%d resume_events=%d max_resume_count=%d",
+        metrics["nemogym_resume/checkpoint_count"],
+        metrics["nemogym_resume/completed_count"],
+        metrics["nemogym_resume/in_progress_count"],
+        metrics["nemogym_resume/resumed_episode_count"],
+        metrics["nemogym_resume/resume_event_count"],
+        metrics["nemogym_resume/max_resume_count"],
+    )
+    return metrics
+
+
 def _collect_rollout_pipeline_metrics() -> dict:
     """Snapshot pipeline instrumentation into wandb-loggable scalars.
 
@@ -1730,10 +1893,10 @@ def _collect_rollout_pipeline_metrics() -> dict:
     Returns:
         Metric name -> value dict; empty when no pipeline exists yet.
     """
+    metrics: dict = _collect_nemogym_resume_metrics()
     if _ROLLOUT_PIPELINE is None:
-        return {}
+        return metrics
     pipeline = _ROLLOUT_PIPELINE
-    metrics: dict = {}
     gate = pipeline.gate
     metrics.update({
         # Queue sizes and gate held are point-in-time reads.
@@ -1741,6 +1904,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
         "rollout_pipeline_output_queue_size": pipeline.output_queue.qsize(),
         "rollout_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+        "rollout_pipeline_partial_snapshot_groups": len(pipeline._assemble_pending),
         "rollout_pipeline_consume_pending_groups": len(pipeline._consume_pending),
         "rollout_pipeline_regen_pending_groups": len(pipeline._regen_tasks),
         "rollout_pipeline_gate_capacity": gate.capacity,

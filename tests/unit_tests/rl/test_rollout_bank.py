@@ -2,16 +2,26 @@
 
 """Parameterized coverage for durable rollout-bank persistence and replay."""
 
+import asyncio
 import json
+import os
 from collections import Counter
 from contextlib import aclosing
 
 import numpy as np
 import pytest
 
-from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
-from megatron.rl.agent.rollout_pipeline import RolloutPipeline
+from megatron.rl import rl_utils, rollout_bank
+from megatron.rl.agent.api import (
+    EpisodeResult,
+    GroupedRolloutRequest,
+    Rollout,
+    RolloutGroup,
+    TokenRollout,
+)
+from megatron.rl.agent.rollout_pipeline import RolloutPipeline, _InferredItem
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
+from megatron.rl.inference import InferenceResponse, LLMChatMessage
 from megatron.rl.rollout_bank import (
     _CONSUMED,
     _FORMAT_VERSION,
@@ -300,3 +310,159 @@ def test_multiple_envs_require_env_ids_for_restore_routing():
 
     with pytest.raises(ValueError, match="configuring multiple active agents"):
         agent.set_restored_groups([])
+
+
+def _episode(text="t0"):
+    response = InferenceResponse(
+        response=LLMChatMessage(role="assistant", content=text),
+        raw_text=text,
+        finish_reason="stop",
+    )
+    return EpisodeResult(
+        responses=[response],
+        conversation=[LLMChatMessage(role="user", content="prompt"), response.response],
+    )
+
+
+def _partial_snapshot(problem_id="p", *, uid="partial-p"):
+    episode = _episode()
+    return {
+        "partial_uid": uid,
+        "env_id": "test",
+        "agent_index": 0,
+        "problem_id": problem_id,
+        "inference_request": {
+            "prompt": [{"role": "user", "content": "prompt"}],
+            "tools": None,
+        },
+        "golden": {"problem_id": problem_id},
+        "rollouts_per_group": 2,
+        "batch_id": 0,
+        "index_in_batch": 0,
+        "finished_members": [
+            {
+                "rollout_idx": 0,
+                "episode": {
+                    "responses": [response.model_dump() for response in episode.responses],
+                    "conversation": [message.model_dump() for message in episode.conversation],
+                },
+            }
+        ],
+    }
+
+
+class TestPartialSnapshot:
+    def test_round_trip_and_empty_snapshot(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.snapshot_partial([_partial_snapshot("p0"), _partial_snapshot("p1", uid="p1")], 0)
+        restored = RolloutBank(str(tmp_path)).restore_partial(0)
+        assert {partial["problem_id"] for partial in restored} == {"p0", "p1"}
+
+        bank.snapshot_partial([], 1)
+        assert RolloutBank(str(tmp_path)).restore_partial(0) == []
+
+    def test_torn_and_checksum_bad_snapshots_fail_safe(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.snapshot_partial([_partial_snapshot()], 0)
+        with open(bank._inflight_path, "r+") as snapshot_file:
+            size = snapshot_file.seek(0, os.SEEK_END)
+            snapshot_file.truncate(size // 2)
+        assert bank.restore_partial(0) == []
+
+        bank.snapshot_partial([_partial_snapshot()], 0)
+        with open(bank._inflight_path) as snapshot_file:
+            payload = json.load(snapshot_file)
+        payload["partials"][0]["problem_id"] = "tampered"
+        with open(bank._inflight_path, "w") as snapshot_file:
+            json.dump(payload, snapshot_file)
+        assert bank.restore_partial(0) == []
+
+    def test_atomic_replace_preserves_previous_snapshot(self, tmp_path, monkeypatch):
+        bank = RolloutBank(str(tmp_path))
+        bank.snapshot_partial([_partial_snapshot("old")], 0)
+
+        def interrupt_replace(src, dst):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(rollout_bank.os, "replace", interrupt_replace)
+        with pytest.raises(KeyboardInterrupt):
+            bank.snapshot_partial([_partial_snapshot("new")], 1)
+        assert [partial["problem_id"] for partial in bank.restore_partial(0)] == ["old"]
+
+    def test_completed_occurrence_deduplicates_through_compaction(self, tmp_path):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        bank.append(_text_group(), partial_uid="partial-p")
+        bank.snapshot_partial([_partial_snapshot()], 0)
+        assert bank.restore_partial(0) == []
+
+        bank.checkpoint(0)
+        reopened = RolloutBank(str(tmp_path))
+        assert "partial-p" in reopened._completed_partial_uids()
+        assert reopened.restore_partial(0) == []
+
+
+class ResumingMockGenerator(MockGenerator):
+    async def prepare_group_rollout(self, request):
+        params = await super().prepare_group_rollout(request)
+        if self.prepare_group_rollout_calls == 1:
+            return params._replace(
+                resume_members={0: _episode("t99")}, partial_uid="partial-resume"
+            )
+        return params
+
+
+@pytest.mark.asyncio
+async def test_pipeline_regenerates_only_missing_partial_members(tmp_path):
+    generator = ResumingMockGenerator()
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(0)
+    request = GroupedRolloutRequest(
+        num_groups=2,
+        rollouts_per_group=2,
+        inference_interface=MockInferenceInterface(),
+    )
+    pipeline = RolloutPipeline(generator, request, parallel_generation_tasks=1, bank=bank)
+
+    async with aclosing(pipeline.run()) as groups:
+        produced = [await asyncio.wait_for(anext(groups), timeout=10) for _ in range(2)]
+
+    assert generator.get_rollout_response_calls == 3
+    assert any(rollout.trajectory == ["t99"] for group in produced for rollout in group)
+    assert "partial-resume" in bank._completed_partial_uids()
+
+
+@pytest.mark.asyncio
+async def test_quiescent_snapshot_serializes_full_episode(tmp_path, monkeypatch):
+    class SnapshotGenerator(MockGenerator):
+        async def prepare_group_rollout(self, request):
+            params = await super().prepare_group_rollout(request)
+            inference_request = request.inference_interface.prepare_request(
+                "t0", request.generation_args
+            )
+            return params._replace(
+                golden={"problem_id": "problem"}, inference_request=inference_request
+            )
+
+    generator = SnapshotGenerator()
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(0)
+    request = GroupedRolloutRequest(
+        num_groups=1,
+        rollouts_per_group=2,
+        inference_interface=MockInferenceInterface(),
+    )
+    pipeline = RolloutPipeline(generator, request, parallel_generation_tasks=1, bank=bank)
+    await pipeline._submit_group_to_infer_queue(group_id=0, batch_id=0, index_in_batch=0)
+    item = await pipeline.infer_queue.get()
+    pipeline._assemble_pending[0] = [
+        _InferredItem(item=item, episode=await item.params.run_episode())
+    ]
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", generator)
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", pipeline)
+
+    rl_utils._snapshot_partial_groups(bank, 0)
+
+    snapshot = bank.restore_partial(0)[0]
+    assert snapshot["partial_uid"] == item.params.partial_uid
+    assert snapshot["finished_members"][0]["episode"]["conversation"][-1]["content"] == "t0"
