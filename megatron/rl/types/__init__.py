@@ -5,7 +5,6 @@ from .rollout import (
     EnvId,
     GroupedRollouts,
     GroupQueuesPerEnv,
-    GroupsPerEnv,
     Rollout,
     RolloutGroup,
     Rollouts,
@@ -20,6 +19,5 @@ __all__ = [
     "RolloutGroup",
     "Rollouts",
     "TokenRollout",
-    "GroupsPerEnv",
     "EnvId",
 ]

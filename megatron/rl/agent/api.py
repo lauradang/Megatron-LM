@@ -26,7 +26,6 @@ from ..types import (
     EnvId,
     GroupedRollouts,
     GroupQueuesPerEnv,
-    GroupsPerEnv,
     Rollout,
     RolloutGroup,
     Rollouts,
@@ -55,7 +54,6 @@ class GroupedRolloutRequest(Request):
     streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
-    num_groups_per_env: GroupsPerEnv | None = None
 
 
 class GroupRolloutParams(NamedTuple):
