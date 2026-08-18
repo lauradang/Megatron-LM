@@ -2,6 +2,7 @@
 
 """Parameterized coverage for durable rollout-bank persistence and replay."""
 
+import asyncio
 import json
 from collections import Counter
 from contextlib import aclosing
@@ -10,7 +11,6 @@ import numpy as np
 import pytest
 
 from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
-from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.rollout_bank import (
     _CONSUMED,
@@ -25,7 +25,7 @@ from megatron.rl.rollout_bank import (
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
 from megatron.rl.types import TokenRollout as SharedTokenRollout
-from tests.unit_tests.rl.test_rollout_generation import MockGenerator, MockInferenceInterface
+from tests.unit_tests.rl.test_grouped_rollouts import MockGenerator, MockInferenceInterface
 
 
 def _token_group(batch_id=0, *, empty=False):
@@ -50,6 +50,9 @@ def _token_group(batch_id=0, *, empty=False):
                 generation_mask=mask,
                 env_id="test",
                 problem_id="p",
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
+                num_evictions=[0],
                 completion_ids=[f"completion-{index}" for index in range(len(tokens))],
             )
             for tokens, logprobs, mask in members
@@ -60,7 +63,16 @@ def _token_group(batch_id=0, *, empty=False):
 
 def _text_group():
     return RolloutGroup(
-        rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")]
+        rollouts=[
+            Rollout(
+                trajectory=["hello world"],
+                reward=0.5,
+                env_id="text",
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
+                num_evictions=[0],
+            )
+        ]
     )
 
 
@@ -80,9 +92,7 @@ def _active_generation(bank_dir):
 def _assert_group_matches(actual, expected):
     assert actual.batch_id == expected.batch_id
     assert len(actual.rollouts) == len(expected.rollouts)
-    for actual_rollout, expected_rollout in zip(
-        actual.rollouts, expected.rollouts, strict=True
-    ):
+    for actual_rollout, expected_rollout in zip(actual.rollouts, expected.rollouts, strict=True):
         assert type(actual_rollout) is type(expected_rollout)
         assert actual_rollout.trajectory == expected_rollout.trajectory
         assert actual_rollout.reward == expected_rollout.reward
@@ -112,7 +122,16 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
         RolloutGroup,
         TokenRollout,
     )
-    assert Rollout(trajectory=["prompt"], reward=None).reward is None
+    assert (
+        Rollout(
+            trajectory=["prompt"],
+            reward=None,
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
+        ).reward
+        is None
+    )
 
     expected = group_factory()
     bank = RolloutBank(str(tmp_path))
@@ -145,9 +164,7 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
         pytest.param(1, True, id="consumed-after-checkpoint"),
     ],
 )
-def test_checkpoint_compacts_at_consumption_boundary(
-    tmp_path, consumed_offset, should_restore
-):
+def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, should_restore):
     """Checkpoint compaction prunes trained groups and preserves future markers."""
     checkpoint_iteration = 10
     bank = RolloutBank(str(tmp_path))
@@ -170,9 +187,7 @@ def test_checkpoint_compacts_at_consumption_boundary(
     restarted = RolloutBank(str(tmp_path))
     restored = restarted.restore(checkpoint_iteration)
     restored_uids = {group.uid for group in restored}
-    assert restored_uids == (
-        {consumed, never_consumed} if should_restore else {never_consumed}
-    )
+    assert restored_uids == ({consumed, never_consumed} if should_restore else {never_consumed})
     for group in restored:
         _assert_group_matches(group, _token_group())
 
@@ -200,6 +215,9 @@ def _env_group(env_id, problem_id):
                 reward=1.0,
                 env_id=env_id,
                 problem_id=problem_id,
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
+                num_evictions=[0],
             )
         ]
     )
@@ -208,9 +226,7 @@ def _env_group(env_id, problem_id):
 def _weighted_agent(env_weights):
     return WeightedMultiTask(
         [
-            AgentConfig(
-                agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight
-            )
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
             for env_id, weight in env_weights
         ]
     )
@@ -244,26 +260,10 @@ def _weighted_agent(env_weights):
             id="streaming-backlog-drains-before-fresh",
         ),
         pytest.param(
-            [("", 1.0)],
-            "",
-            1,
-            2,
-            2,
-            {"": 2},
-            [1],
-            False,
-            id="single-environment-without-env-id",
+            [("", 1.0)], "", 1, 2, 2, {"": 2}, [1], False, id="single-environment-without-env-id"
         ),
         pytest.param(
-            [("a", 1.0)],
-            "a",
-            0,
-            4,
-            4,
-            {"a": 4},
-            [4],
-            True,
-            id="fresh-groups-write-through",
+            [("a", 1.0)], "a", 0, 4, 4, {"a": 4}, [4], True, id="fresh-groups-write-through"
         ),
     ],
 )
@@ -281,8 +281,7 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
     """Restored groups retain weighted routing; fresh groups remain durable."""
     agent = _weighted_agent(env_weights)
     restored = [
-        _env_group(restored_env, problem_id=f"cached-{index}")
-        for index in range(restored_count)
+        _env_group(restored_env, problem_id=f"cached-{index}") for index in range(restored_count)
     ]
     assert agent.set_restored_groups(restored) == restored_count
 
@@ -294,23 +293,16 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
     bank = RolloutBank(str(tmp_path)) if write_through else None
     if bank is not None:
         bank.set_collection(0)
+    agent._rollout_bank = bank
     request = GroupedRolloutRequest(
         num_groups=request_groups,
         rollouts_per_group=1,
         inference_interface=MockInferenceInterface(),
-    )
-    pipeline = RolloutPipeline(
-        agent,
-        request,
-        parallel_generation_tasks=1,
-        initial_batch_id=20,
-        bank=bank,
+        streaming=take_count > request_groups,
     )
 
-    async with aclosing(pipeline.run()) as groups:
-        produced = [
-            await asyncio.wait_for(anext(groups), timeout=10) for _ in range(take_count)
-        ]
+    async with aclosing(agent.get_grouped_rollouts(request)) as groups:
+        produced = [await asyncio.wait_for(anext(groups), timeout=10) for _ in range(take_count)]
 
     assert len(produced) == take_count
     assert Counter(group[0].env_id for group in produced) == expected_envs
@@ -320,13 +312,6 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
     cached_problem_ids = {f"cached-{index}" for index in range(restored_count)}
     assert cached_problem_ids <= {group[0].problem_id for group in produced}
     assert not agent._restored_groups.get(restored_env)
-
-    assert [group.batch_id for group in produced] == [
-        20 + index // request_groups for index in range(take_count)
-    ]
-    assert [group.index_in_batch for group in produced] == [
-        index % request_groups for index in range(take_count)
-    ]
 
     if bank is not None:
         bank.close()
