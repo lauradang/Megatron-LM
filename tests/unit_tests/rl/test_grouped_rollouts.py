@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from collections import deque
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -89,7 +90,9 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
 
 
 def test_grouped_rollout_generator_initializes_rollout_bank():
-    assert MockGenerator()._rollout_bank is None
+    generator = MockGenerator()
+    assert generator._rollout_bank is None
+    assert generator._restored_groups is None
 
 
 def test_rollout_group_defines_optional_uid():
@@ -341,6 +344,63 @@ class TestGroupedRollouts:
             assert trajectories[: len(expected_trajectories)] == expected_trajectories
 
     @pytest.mark.asyncio
+    async def test_batch_order_starts_at_initial_batch_id(self):
+        gen = MockGenerator(parallel_generation_tasks=1)
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+            initial_batch_id=10,
+        )
+
+        groups = []
+        async for group in gen.get_grouped_rollouts(request):
+            groups.append(group)
+            if len(groups) == 4:
+                break
+
+        assert [group.batch_id for group in groups] == [10, 10, 11, 11]
+        assert [group.index_in_batch for group in groups] == [0, 1, 0, 1]
+
+    @pytest.mark.asyncio
+    async def test_restored_group_replaces_fresh_work_with_current_batch_metadata(self):
+        gen = MockGenerator(parallel_generation_tasks=1)
+        restored = RolloutGroup(
+            rollouts=[
+                Rollout(
+                    trajectory=["cached"],
+                    reward=1.0,
+                    env_id="test",
+                    policy_epoch=[[(0, 0)]],
+                    kv_cache_epoch=[[(0, 0)]],
+                    num_evictions=[0],
+                )
+            ],
+            batch_id=99,
+            index_in_batch=99,
+        )
+        gen._restored_groups = deque([restored])
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+            initial_batch_id=10,
+        )
+
+        groups = [group async for group in gen.get_grouped_rollouts(request)]
+
+        assert [group.batch_id for group in groups] == [10, 10]
+        assert [group.index_in_batch for group in groups] == [0, 1]
+        assert groups[0][0].trajectory == ["cached"]
+        assert gen.prepare_group_rollout_calls == 1
+        assert gen._active_pipeline is None
+
+    @pytest.mark.asyncio
     async def test_rollout_submission_granularity_limits_inference_concurrency(self):
         gen = MockGenerator(parallel_generation_tasks=2)
         inference_interface = MockInferenceInterface(num_slow_calls=100)
@@ -412,73 +472,10 @@ class TestGroupedRollouts:
             assert sub_req.streaming == request.streaming
             assert sub_req.submission_granularity == request.submission_granularity
             assert sub_req.consumption_granularity == request.consumption_granularity
+            assert sub_req.initial_batch_id == request.initial_batch_id
         assert [agent.parallel_generation_tasks for agent in mt.agents] == (
             expected_parallel_generation_tasks
         )
-
-    @pytest.mark.asyncio
-    async def test_num_groups_per_env_override_produces_residual_shape(self):
-        """An explicit per-env override bypasses the weight split.
-
-        Used to fill the per-env residual left after injecting restored
-        rollout-bank groups: a residual of 0 for an over-represented env must stay
-        0, not be re-weighted back up.
-        """
-        configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=1.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "c"}, weight=1.0),
-        ]
-        mt = WeightedMultiTask(configs)
-        mt.parallel_generation_tasks = 4
-
-        request = GroupedRolloutRequest(
-            num_groups=4,
-            rollouts_per_group=1,
-            inference_interface=MockInferenceInterface(),
-            streaming=False,
-            num_groups_per_env={"a": 0, "b": 2, "c": 2},
-        )
-        env_ids = [g[0].env_id async for g in mt.get_grouped_rollouts(request)]
-        # Equal weights alone would give a/b/c ~ [2, 1, 1]; the override forces the
-        # residual shape instead: no env "a", two each of "b" and "c".
-        assert sorted(env_ids) == ["b", "b", "c", "c"]
-
-    @pytest.mark.asyncio
-    async def test_num_groups_per_env_none_matches_weight_split(self):
-        """Regression: omitting the override reproduces the weight-proportional split."""
-        configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
-        ]
-        mt = WeightedMultiTask(configs)
-        mt.parallel_generation_tasks = 4
-        request = GroupedRolloutRequest(
-            num_groups=4,
-            rollouts_per_group=1,
-            inference_interface=MockInferenceInterface(),
-            streaming=False,
-        )
-        env_ids = [g[0].env_id async for g in mt.get_grouped_rollouts(request)]
-        assert sorted(env_ids) == ["a", "a", "a", "b"]
-
-    @pytest.mark.asyncio
-    async def test_num_groups_per_env_rejects_unknown_env(self):
-        configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=1.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
-        ]
-        mt = WeightedMultiTask(configs)
-        request = GroupedRolloutRequest(
-            num_groups=2,
-            rollouts_per_group=1,
-            inference_interface=MockInferenceInterface(),
-            streaming=False,
-            num_groups_per_env={"a": 2, "z": 0},
-        )
-        with pytest.raises(ValueError, match="unknown env_id"):
-            async for _ in mt.get_grouped_rollouts(request):
-                pass
 
     @pytest.mark.parametrize(
         "num_groups, all_envs_active",
