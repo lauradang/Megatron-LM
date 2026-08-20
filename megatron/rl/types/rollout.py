@@ -38,6 +38,7 @@ class TokenRollout(AgentBaseModel):
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
+    generation_cap: int | None = None
     # When set, replaces this rollout's group-normalized advantage with a fixed
     # value after group normalization in calculate_grpo_advantages.
     advantage_override: float | None = None

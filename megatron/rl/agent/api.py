@@ -323,6 +323,11 @@ class _RolloutPipeline:
                     await self.gate.acquire_for("G")
                     restored = self.agent.take_restored_group()
                     if restored is not None:
+                        expected_env_id = getattr(self.agent, "env_id", "")
+                        assert all(rollout.env_id == expected_env_id for rollout in restored), (
+                            f"Restored rollout group routed to env {expected_env_id!r} contains "
+                            f"members for {[rollout.env_id for rollout in restored]}"
+                        )
                         restored.batch_id = batch_id
                         restored.index_in_batch = index_in_batch
                         self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
