@@ -798,7 +798,9 @@ class RolloutBank:
         """Replay the ledger and return groups not yet trained through ``T``."""
         return self._restore_state(trained_through)[0]
 
-    def _restore_state(self, trained_through: int) -> tuple[list["RolloutGroup"], dict[str, int]]:
+    def _restore_state(
+        self, trained_through: int, *, preserve_problem_only: bool = False
+    ) -> tuple[list["RolloutGroup"], dict[str, int]]:
         """Return survivors and the active generation's collapsed markers.
 
         Folds the rollout-granular ledger back into groups:
@@ -809,6 +811,11 @@ class RolloutBank:
 
         Callers must have drained any queued records first, so everything appended
         so far is already durable and no write can land mid-read.
+
+        ``preserve_problem_only`` is for live checkpoint compaction: a producer may
+        still append members after the FIFO boundary, so its problem record must
+        cross that boundary even when no members have finished yet. Restart recovery
+        leaves it false because no producer survives to finish such a group.
         """
         self._close_handles()
         manifest = self._read_manifest()
@@ -843,9 +850,20 @@ class RolloutBank:
 
         restored: list["RolloutGroup"] = []
         for group_uid in order:
-            group = self._assemble_restored(group_uid, members[group_uid], problems.get(group_uid))
+            group_members = members[group_uid]
+            problem_state = problems.get(group_uid)
+            group = self._assemble_restored(group_uid, group_members, problem_state)
             if group is not None:
                 restored.append(group)
+            elif preserve_problem_only and not group_members and problem_state is not None:
+                # A live producer may finish members after the checkpoint's FIFO
+                # boundary. Carry its already-durable problem into the compacted
+                # generation so those late members remain restorable.
+                restored.append(
+                    RolloutGroup(
+                        rollouts=[], uid=group_uid, member_indices=[], problem_state=problem_state
+                    )
+                )
         return restored, markers
 
     def _assemble_restored(
@@ -1045,7 +1063,7 @@ class RolloutBank:
         writer remains closed until the next ``set_collection()`` call selects the
         current rollout collection.
         """
-        survivors, markers = self._restore_state(iteration)
+        survivors, markers = self._restore_state(iteration, preserve_problem_only=True)
         survivor_uids = {group.uid for group in survivors}
         retained_markers = {
             uid: marker_iter

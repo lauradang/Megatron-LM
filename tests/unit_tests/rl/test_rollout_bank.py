@@ -428,6 +428,46 @@ def test_checkpoint_preserves_the_active_collection_for_late_writes(tmp_path):
     assert {group.uid for group in bank.restore(7)} == {before, after}
 
 
+@pytest.mark.parametrize(
+    "checkpoint_iterations",
+    [pytest.param([7], id="one-boundary"), pytest.param([7, 8], id="two-boundaries")],
+)
+def test_checkpoint_preserves_problem_for_members_finishing_after_its_fifo_boundary(
+    tmp_path, checkpoint_iterations
+):
+    """A problem before compaction must remain paired with members written after it."""
+    bank = _bank(tmp_path, 2)
+    bank.set_collection(9)
+    uid = bank.reserve_group_uid()
+    bank.append_problem(uid, PROBLEM)
+
+    for iteration in checkpoint_iterations:
+        bank.checkpoint_preserving_collection(iteration)
+
+    bank.append_rollout(uid, 1, _token())
+    bank.close()
+
+    restored = _bank(tmp_path, 2).restore(checkpoint_iterations[-1])
+    assert [group.uid for group in restored] == [uid]
+    assert restored[0].problem_state == PROBLEM
+    assert restored[0].member_indices == [1]
+    assert restored[0].missing_indices(2) == [0]
+
+
+def test_recovery_discards_problem_only_compaction_carriers(tmp_path):
+    """After a restart no producer remains to finish a problem-only group."""
+    bank = _bank(tmp_path, 2)
+    bank.set_collection(8)
+    uid = bank.reserve_group_uid()
+    bank.append_problem(uid, PROBLEM)
+    bank.checkpoint_preserving_collection(7)
+    bank.close()
+
+    restarted = _bank(tmp_path, 2)
+    assert restarted.recover(7) == []
+    assert restarted.restore(7) == []
+
+
 def _env_group(env_id, problem_id):
     return RolloutGroup(
         rollouts=[
