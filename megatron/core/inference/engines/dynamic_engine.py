@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Dict, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import Tensor
@@ -53,6 +53,7 @@ from megatron.core.inference.inference_request import (
     FinishedRequestRecord,
     OffloadedRequestPayload,
     RequestPayloadStager,
+    RequestPayloadStageResult,
     RequestPromptPreparer,
     Status,
     compute_media_cache_key,
@@ -553,6 +554,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # (log probs, MoE routing indices, token ids) is handed to stage() and dropped from the
         # reply instead of riding the RESTful API. Consumer-owned, so it survives reset().
         self.payload_stager: Optional[RequestPayloadStager] = None
+        # One task per staged reply: stage() runs on a worker thread so a slow write
+        # never pauses decoding, and the reply is sent once that request's write returns.
+        self._staging_tasks: Set[asyncio.Task] = set()
+        # Largest in-flight staging backlog since the last step log (see _staging_log_suffix).
+        self._staging_tasks_peak = 0
         self.prompt_preparer: Optional[RequestPromptPreparer] = None
 
         # Set callback for getting stop word finished request IDs
@@ -1682,7 +1688,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Failed requests are sent immediately but remain in the engine until the next
         # bookkeeping pass; only completed requests are indexed and staged.
-        # A reply is stripped only when its payload was staged.
+        # A reply is stripped only when its payload was staged. Staged replies are sent
+        # by their staging task (see _stage_and_reply), after the rest of this batch.
         serialized = []
         for request in requests:
             if request.status == Status.FAILED:
@@ -1697,23 +1704,79 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {request.uid!r}"
                 self.local_metadata_ledger[request.uid] = finished_metadata
-            serialized.append(self._serialize_finished_request(request, finished_metadata))
-        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
+            if self.payload_stager is not None and not getattr(
+                request.sampling_params, "streaming", False
+            ):
+                task = asyncio.get_running_loop().create_task(
+                    self._stage_and_reply(request, finished_metadata)
+                )
+                self._staging_tasks.add(task)
+                task.add_done_callback(self._staging_tasks.discard)
+                self._staging_tasks_peak = max(self._staging_tasks_peak, len(self._staging_tasks))
+                continue
+            serialized.append(self._serialize_finished_request(request, None))
+        if serialized:
+            self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
-    def _serialize_finished_request(
-        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
-    ) -> Dict:
-        """Stage a non-streaming accepted payload before constructing its coordinator reply."""
-        stage_result = None
-        if self.payload_stager is not None and not getattr(
-            request.sampling_params, "streaming", False
-        ):
-            stage_result = self.payload_stager.stage(
+    async def _stage_and_reply(
+        self, request: DynamicInferenceRequest, finished_metadata: FinishedRequestRecord
+    ) -> None:
+        """Stage one completed payload on a worker thread, then send its reply.
+
+        The payload stager's write may be a slow network round trip (e.g. media). Running
+        it here keeps the engine loop decoding the other requests; the reply still waits
+        for this request's write, so its stage metadata describes a durable write. The
+        reply is sent after the await, back on the engine loop's thread, which is the
+        only thread that uses the ZMQ socket. A failed write keeps the payload on the
+        reply.
+        """
+        # Built on the loop thread: it reads (and moves to CPU) engine-owned request state.
+        payload = OffloadedRequestPayload.from_request(request)
+        try:
+            stage_result = await asyncio.to_thread(
+                self.payload_stager.stage,
                 request.uid,
-                OffloadedRequestPayload.from_request(request),
+                payload,
                 finished_metadata=finished_metadata,
                 offload_params=request.offload_params,
             )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Payload staging failed for request %s", request.uid)
+            stage_result = None
+        reply = self._serialize_finished_request(request, stage_result)
+        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames([reply]))
+
+    async def _drain_staging_tasks(self) -> None:
+        """Wait for in-flight staging tasks so their replies are sent before teardown."""
+        if not self._staging_tasks:
+            return
+        in_flight = len(self._staging_tasks)
+        start = time.monotonic()
+        while self._staging_tasks:
+            await asyncio.gather(*list(self._staging_tasks), return_exceptions=True)
+        logger.info(
+            "Waiting for %d in-flight payload staging task(s) before shutdown took %.3fs",
+            in_flight,
+            time.monotonic() - start,
+        )
+
+    def _staging_log_suffix(self) -> str:
+        """Step-log fragment for the staging backlog; resets the peak to the current size.
+
+        A backlog that keeps growing means the stager's writes cannot keep up with the
+        rate requests finish.
+        """
+        if self.payload_stager is None:
+            return ""
+        in_flight = len(self._staging_tasks)
+        peak = max(self._staging_tasks_peak, in_flight)
+        self._staging_tasks_peak = in_flight
+        return " ... payload staging: in-flight %d, peak %d" % (in_flight, peak)
+
+    def _serialize_finished_request(
+        self, request: DynamicInferenceRequest, stage_result: Optional[RequestPayloadStageResult]
+    ) -> Dict:
+        """Construct a completed request's coordinator reply from its staging result."""
         serialized = request.serialize(
             payload_offloaded=stage_result is not None,
             payload_stage_metadata=(
@@ -4048,6 +4111,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         msa.max_slots - msa.free_count,
                         msa.max_slots,
                     )
+            output_str += self._staging_log_suffix()
             if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
             logger.info(output_str)
@@ -4532,6 +4596,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Called from the engine loop's finally block after the loop exits.
         """
+        # Staged replies still in flight must go out before the socket closes.
+        await self._drain_staging_tasks()
         self.state = EngineState.STOPPED
 
         # Cleanup the request futures.
