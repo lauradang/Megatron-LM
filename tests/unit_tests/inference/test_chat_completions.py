@@ -25,6 +25,7 @@ import torch
 
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
+    CONVERTED_MESSAGE_ROLES_FIELD,
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
@@ -1504,9 +1505,87 @@ async def test_offloaded_prefix_stitching_metadata_covers_text_and_multimodal_hi
             "stager": {"request_id": "r0"},
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD: history,
             PREFIX_EOS_TOKEN_ID_FIELD: [2],
+            CONVERTED_MESSAGE_ROLES_FIELD: ["user", "assistant", "user"],
             **({PREFIX_MEDIA_COUNT_FIELD: 1} if prefix_has_media else {}),
         }
     ]
+
+
+_ROLE_MESSAGES = [
+    {"role": "system", "content": "be brief"},
+    {"role": "user", "content": "first question"},
+    {"role": "assistant", "content": "first answer"},
+    {"role": "tool", "content": "tool output"},
+    {"role": "user", "content": "second question"},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("offload_params", "expected_offload"),
+    [
+        pytest.param(None, None, id="no-offload-params"),
+        pytest.param(
+            {"stager": {"request_id": "r0"}},
+            {
+                "stager": {"request_id": "r0"},
+                CONVERTED_MESSAGE_ROLES_FIELD: ["system", "user", "assistant", "tool", "user"],
+            },
+            id="offload-params",
+        ),
+    ],
+)
+async def test_converted_message_roles_ride_along_only_with_offload_params(
+    offload_params, expected_offload
+):
+    client = ReplyingClient()
+    app = build_app(CHAT_PATH, client)
+    body = {"messages": _ROLE_MESSAGES, "prevent_retokenization": False, "max_tokens": 1}
+    if offload_params is not None:
+        body["offload_params"] = offload_params
+
+    with mock.patch.object(
+        chat_completions_module,
+        "_tokenize_chat_template_sync",
+        side_effect=_fake_tokenize(_TEXT_HISTORY, [30]),
+    ):
+        response = await app.test_client().post(CHAT_PATH, json=body)
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    offload = client.offload_params[0]
+    if expected_offload is None:
+        assert offload is None
+    else:
+        # The assistant turn also ships the stitching metadata; only the roles matter here.
+        assert {key: offload[key] for key in expected_offload} == expected_offload
+    if offload_params is not None:
+        assert offload_params == {"stager": {"request_id": "r0"}}  # client dict not mutated
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bad_message", "index"),
+    [
+        pytest.param("hello", 1, id="not-an-object"),
+        pytest.param({"content": "no role"}, 1, id="missing-role"),
+        pytest.param({"role": 3, "content": "x"}, 1, id="non-string-role"),
+    ],
+)
+async def test_converted_message_roles_reject_messages_without_a_role(bad_message, index):
+    client = ReplyingClient([])
+    app = build_app(CHAT_PATH, client)
+    body = {
+        "messages": [{"role": "user", "content": "hello"}, bad_message],
+        "offload_params": {"stager": {"request_id": "r0"}},
+    }
+
+    response = await app.test_client().post(CHAT_PATH, json=body)
+
+    assert response.status_code == 400
+    assert await response.get_data(as_text=True) == (
+        f"Invalid 'messages': message {index} must be an object with a string 'role'"
+    )
+    assert client.prompt_tokens == []  # nothing reached the engine
 
 
 @pytest.mark.asyncio

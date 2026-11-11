@@ -1641,6 +1641,11 @@ PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 PREFIX_EXPANDED_TOKEN_COUNT_FIELD = "_prefix_expanded_token_count"
 PREFIX_MEDIA_COUNT_FIELD = "_prefix_media_count"
 
+# Reserved field written by the chat endpoint when the client sent offload metadata: the
+# ordered roles of the messages the chat template renders, so a RequestPromptPreparer can
+# check where a stored previous turn ends.
+CONVERTED_MESSAGE_ROLES_FIELD = "_converted_message_roles"
+
 # Reserved field a RequestPromptPreparer writes, as ``ResumedGeneration.to_wire()``,
 # to resume a generation at admission; the engine pops it before the request keeps its params.
 RESUMED_GENERATION_FIELD = "_resumed_generation"

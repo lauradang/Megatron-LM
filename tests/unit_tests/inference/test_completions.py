@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("quart")
 
+from megatron.core.inference.inference_request import CONVERTED_MESSAGE_ROLES_FIELD
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
     build_response,
     unwrap_batch,
@@ -189,7 +190,15 @@ async def test_offload_params_are_validated_before_submission(
     assert response.status_code == status, await response.get_data(as_text=True)
     if expected_error is not None:
         assert expected_error in await response.get_data(as_text=True)
-    assert client.offload_params == ([offload_params] if status == 200 else [])
+    if status != 200:
+        assert client.offload_params == []
+    elif path == CHAT_PATH:
+        # Chat adds only the reserved roles field next to the client's keys.
+        assert client.offload_params == [
+            {**offload_params, CONVERTED_MESSAGE_ROLES_FIELD: ["user"]}
+        ]
+    else:
+        assert client.offload_params == [offload_params]
 
 
 # --- request validation -----------------------------------------------------

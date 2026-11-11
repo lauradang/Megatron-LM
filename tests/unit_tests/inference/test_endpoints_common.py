@@ -18,6 +18,7 @@ import pytest
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.config import MultimodalPromptConfig
+from megatron.core.inference.inference_request import CONVERTED_MESSAGE_ROLES_FIELD
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
     abort_requests,
@@ -901,7 +902,12 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
     assert response.status_code == 200, await response.get_data(as_text=True)
     assert response.mimetype == "text/event-stream"
     assert client.streamed == [1, 2, 3]
-    assert client.offload_params == [offload_params] * 3
+    if path == CHAT_PATH:
+        # Chat also tells the engine's prompt preparer which message roles it rendered.
+        expected_offload = {**offload_params, CONVERTED_MESSAGE_ROLES_FIELD: ["user"]}
+    else:
+        expected_offload = offload_params
+    assert client.offload_params == [expected_offload] * 3
     payloads, done = await sse_payloads(response)
     assert done
     finals = [

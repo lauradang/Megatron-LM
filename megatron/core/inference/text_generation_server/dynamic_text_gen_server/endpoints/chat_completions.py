@@ -22,6 +22,7 @@ _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
+    CONVERTED_MESSAGE_ROLES_FIELD,
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
@@ -615,6 +616,19 @@ def _has_previous_turn_tokens(last_assistant_message):
         and isinstance(generation_token_ids, list)
         and bool(prompt_token_ids or generation_token_ids)
     )
+
+
+def _converted_message_roles(template_messages):
+    """Return the ordered roles of the messages the chat template renders.
+
+    Raises ValueError when a message is not an object with a string 'role'.
+    """
+    roles = []
+    for index, message in enumerate(template_messages):
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            raise ValueError(f"message {index} must be an object with a string 'role'")
+        roles.append(message["role"])
+    return roles
 
 
 def _last_assistant_message(template_messages):
@@ -1375,6 +1389,13 @@ try:
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
         template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
+        if offload_params is not None:
+            # Let the engine's RequestPromptPreparer see which turns the prompt is made of.
+            try:
+                roles = _converted_message_roles(template_messages)
+            except ValueError as error:
+                return Response(f"Invalid 'messages': {error}", status=400)
+            offload_params = {**offload_params, CONVERTED_MESSAGE_ROLES_FIELD: roles}
         template_tools = _sanitize_tools_for_template(options.tools)
 
         try:
